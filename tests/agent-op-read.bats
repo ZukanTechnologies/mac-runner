@@ -21,6 +21,8 @@ mode="${STUB_OP_MODE:-success}"
 if [[ "$mode" == "fail_then_success" && $count -ge 3 ]]; then mode=success; fi
 case "$mode" in
   success)      echo "test-pat" ;;
+  success_warn) echo "[WARNING] update available" >&2; echo "test-pat" ;;
+  success_empty) echo "" ;;
   bad_token)    echo "(401) Unauthorized: invalid service account token" >&2; exit 1 ;;
   missing_item) echo "\"runner-jit-pat\" isn't an item in the \"mac-runner\" vault" >&2; exit 1 ;;
   *)            echo "error: connection refused" >&2; exit 1 ;;
@@ -95,6 +97,41 @@ op_calls() {
   [ "$status" -eq 1 ]
   [[ "$output" == *"$TEST_TMP/nonexistent"* ]]
   [ "$(op_calls)" -eq 0 ]
+}
+
+@test "op warnings on stderr never contaminate the credential" {
+  export STUB_OP_MODE=success_warn
+  pat="$(resolve_zukan_gh_pat 2>/dev/null)"
+  [ "$pat" = "test-pat" ]
+}
+
+@test "empty credential from a zero-exit op read is a failure, logged distinguishably" {
+  export STUB_OP_MODE=success_empty
+  run resolve_zukan_gh_pat
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"empty credential"* ]]
+}
+
+@test "raw op error text is not written to the log (sanitized classification only)" {
+  export STUB_OP_MODE=unreachable
+  run resolve_zukan_gh_pat
+  [ "$status" -eq 1 ]
+  [[ "$output" != *"connection refused"* ]]
+  [[ "$output" == *"op unreachable"* ]]
+}
+
+@test "failed credential fetch never invokes tart (execution-level)" {
+  cat > "$TEST_TMP/bin/tart" <<'STUB'
+#!/usr/bin/env bash
+echo "$@" >> "$STUB_STATE_DIR/tart-calls"
+STUB
+  chmod +x "$TEST_TMP/bin/tart"
+  export STUB_OP_MODE=unreachable
+  export CYCLE_BACKOFF=0
+  export BASE_IMAGE=test-image SLOT=1
+  run run_cycle
+  [ "$status" -eq 0 ]
+  [ ! -f "$STUB_STATE_DIR/tart-calls" ]
 }
 
 @test "credential fetch precedes VM clone in the cycle (in-flight VM safety)" {

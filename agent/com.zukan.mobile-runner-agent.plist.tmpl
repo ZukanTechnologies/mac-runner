@@ -6,6 +6,9 @@
   Rendered by the mac-runner installer, one copy per VM slot ({{SLOT}} = 1..2;
   Apple's Virtualization framework allows max 2 concurrent VMs per host).
   Placeholders: {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}}.
+  Substituted values sit inside XML <string> elements — the renderer must
+  reject values containing & < > (the installer's render helper enforces
+  this; ZUK-2158).
   Manual use: replace every placeholder, save as
   ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot<N>.plist, then
   `launchctl bootstrap gui/$(id -u) <path>`.
