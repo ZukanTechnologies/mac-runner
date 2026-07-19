@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ephemeral mobile-runner agent (ZUK-1994). Install ONE COPY PER VM SLOT on
+  each mobile-runner Mac. Apple's Virtualization framework allows max 2
+  concurrent VMs per host, so install slots 1 and 2 at most.
+
+  IMPORTANT — run as a LaunchAgent in a logged-in GUI session, NOT a system
+  LaunchDaemon. macOS 15+/Tahoe requires an unlocked login.keychain to boot a
+  Tart VM (an undocumented Virtualization.framework requirement), and that
+  keychain only exists inside a logged-in user session. So:
+
+    1. Enable auto-login for the CI user (System Settings → Users & Groups →
+       "Automatically log in as …") so a GUI session exists after every reboot.
+    2. Keep the Mac awake:  sudo pmset -a sleep 0 disksleep 0
+    3. Load this as a PER-USER agent (no sudo — gui/$(id -u) is your session):
+
+       mkdir -p ~/Library/LaunchAgents
+       cp com.zukan.mobile-runner-agent.plist \
+         ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
+       # edit: Label suffix, SLOT, ZUKAN_GH_PAT, BASE_IMAGE, log paths
+       launchctl bootstrap gui/$(id -u) \
+         ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
+
+    For slot 2, copy again and change the Label suffix, SLOT, and both log
+    paths to slot2.
+
+  See docs/mobile-cicd.md § "Runner hosts" and the ZUK-1994 runbook.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.zukan.mobile-runner-agent.slot1</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/zukan/mobile-runner-agent.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SLOT</key>
+    <string>1</string>
+    <key>BASE_IMAGE</key>
+    <string>zukan-mobile-runner-2026.07.2</string>
+    <key>ZUKAN_GH_PAT</key>
+    <string>SET_ME_FROM_1PASSWORD__runner-jit-pat</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- A LaunchAgent runs as you (not root), so it cannot write /var/log.
+       /tmp is fine; point at /Users/<you>/Library/Logs/ for persistence. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/zukan-mobile-runner-agent.slot1.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/zukan-mobile-runner-agent.slot1.log</string>
+</dict>
+</plist>
