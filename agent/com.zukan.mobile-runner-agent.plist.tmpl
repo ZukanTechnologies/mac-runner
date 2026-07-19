@@ -1,36 +1,33 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Ephemeral mobile-runner agent (ZUK-1994). Install ONE COPY PER VM SLOT on
-  each mobile-runner Mac. Apple's Virtualization framework allows max 2
-  concurrent VMs per host, so install slots 1 and 2 at most.
+  Ephemeral mobile-runner agent — launchd template (ZUK-2155).
+
+  Rendered by the mac-runner installer, one copy per VM slot ({{SLOT}} = 1..2;
+  Apple's Virtualization framework allows max 2 concurrent VMs per host).
+  Placeholders: {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}}.
+  Substituted values sit inside XML <string> elements — the renderer must
+  reject values containing & < > (the installer's render helper enforces
+  this; ZUK-2158).
+  Manual use: replace every placeholder, save as
+  ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot<N>.plist, then
+  `launchctl bootstrap gui/$(id -u) <path>`.
+
+  CONTAINS NO CREDENTIAL (FR-009/FR-010): the agent op-reads the JIT PAT
+  from 1Password every cycle using the service-account token file
+  (~/.config/zukan-runner/op-token, written 0600 by the installer).
+  Never add ZUKAN_GH_PAT here — it is a local-debug env override only.
 
   IMPORTANT — run as a LaunchAgent in a logged-in GUI session, NOT a system
   LaunchDaemon. macOS 15+/Tahoe requires an unlocked login.keychain to boot a
   Tart VM (an undocumented Virtualization.framework requirement), and that
-  keychain only exists inside a logged-in user session. So:
-
-    1. Enable auto-login for the CI user (System Settings → Users & Groups →
-       "Automatically log in as …") so a GUI session exists after every reboot.
-    2. Keep the Mac awake:  sudo pmset -a sleep 0 disksleep 0
-    3. Load this as a PER-USER agent (no sudo — gui/$(id -u) is your session):
-
-       mkdir -p ~/Library/LaunchAgents
-       cp com.zukan.mobile-runner-agent.plist \
-         ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
-       # edit: Label suffix, SLOT, ZUKAN_GH_PAT, BASE_IMAGE, log paths
-       launchctl bootstrap gui/$(id -u) \
-         ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
-
-    For slot 2, copy again and change the Label suffix, SLOT, and both log
-    paths to slot2.
-
-  See docs/mobile-cicd.md § "Runner hosts" and the ZUK-1994 runbook.
+  keychain only exists inside a logged-in user session. So the host needs
+  auto-login for the CI user and `sudo pmset -a sleep 0 disksleep 0`.
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.zukan.mobile-runner-agent.slot1</string>
+  <string>com.zukan.mobile-runner-agent.slot{{SLOT}}</string>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/zukan/mobile-runner-agent.sh</string>
@@ -38,11 +35,11 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>SLOT</key>
-    <string>1</string>
+    <string>{{SLOT}}</string>
     <key>BASE_IMAGE</key>
-    <string>zukan-mobile-runner-2026.07.2</string>
-    <key>ZUKAN_GH_PAT</key>
-    <string>SET_ME_FROM_1PASSWORD__runner-jit-pat</string>
+    <string>{{BASE_IMAGE}}</string>
+    <key>RUNNER_EXTRA_LABELS</key>
+    <string>{{EXTRA_LABELS}}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
@@ -50,11 +47,12 @@
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <!-- A LaunchAgent runs as you (not root), so it cannot write /var/log.
-       /tmp is fine; point at /Users/<you>/Library/Logs/ for persistence. -->
+  <!-- A LaunchAgent runs as the CI user (not root), so it cannot write
+       /var/log. {{LOG_PATH}} defaults to /tmp/zukan-mobile-runner-agent.slotN.log
+       (point at ~/Library/Logs/ for persistence across reboots). -->
   <key>StandardOutPath</key>
-  <string>/tmp/zukan-mobile-runner-agent.slot1.log</string>
+  <string>{{LOG_PATH}}</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/zukan-mobile-runner-agent.slot1.log</string>
+  <string>{{LOG_PATH}}</string>
 </dict>
 </plist>
