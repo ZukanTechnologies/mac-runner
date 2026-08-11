@@ -28,7 +28,7 @@ The default install asks nothing beyond the token. Overrides are env-var prefixe
 |---|---|---|
 | `SLOTS` | `2` | VM slots (max 2 — Apple Virtualization caps concurrent VMs per host) |
 | `RUNNER_EXTRA_LABELS` | *(empty)* | Comma-separated labels appended to `mobile-runner,macos,arm64` |
-| `IMAGE_VERSION` | [`IMAGE_VERSION`](IMAGE_VERSION) file | Escape-hatch image override |
+| `IMAGE_VERSION` | *(required)* | Image version to pull; the blessed pin lives in zukan's `docs/mobile-cicd.md` |
 | `FORCE` | `0` | `1` = don't wait for idle slots; terminates in-flight CI VMs (they retry on re-run) |
 
 **Upgrades = re-run the same one-liner.** The installer is idempotent: it converges the host onto the current repo HEAD + image pin, prunes superseded images, and migrates legacy layouts. There is no other update mechanism.
@@ -50,84 +50,29 @@ One vault, one read-only service account, two items. Full contract: [`specs/027-
 - **GHCR PAT**: replace the item value; used on each host's next install/upgrade run.
 - **SA token**: create a new token → re-run the installer on each host (the one rotation that touches hosts, by design).
 
-## Base image
+## Base image — lives in the zukan repo, not here
 
-> **`packer/` in this repo is the source of truth for the image.**
+> **This repo does not own the image template.** It is
+> [`infra/mobile-ci/packer/`](https://github.com/ZukanTechnologies/zukan/tree/main/infra/mobile-ci/packer)
+> in the zukan monorepo. Build, version and roll out from there;
+> [`docs/mobile-cicd.md`](https://github.com/ZukanTechnologies/zukan/blob/main/docs/mobile-cicd.md)
+> is the reference.
 >
-> It was previously a pre-ZUK-2131 fork that built Xcode **26.5** while the zukan
-> monorepo's `infra/mobile-ci/packer/` built **26.6** — two copies, silently
-> divergent, and building from this one produced an image that could not honestly
-> carry the `xcode-26.6` capability label the mobile workflows gate on. The live
-> template has been ported here and the monorepo copy removed.
->
-> The **agent** half (`agent/`) is deliberately NOT consolidated: hosts are
-> provisioned by [`troymccabe/setup`](https://github.com/troymccabe/setup) →
-> `mac/runner/setup`, and the zukan monorepo's `infra/mobile-ci/runner/` still
-> drives the Refractor host. This repo owns the image; it does not own the fleet.
+> A fork of the template used to live here at `packer/`, alongside an
+> `IMAGE_VERSION` pin. The two copies drifted: this one stayed on the
+> pre-ZUK-2131 template and built Xcode **26.5**, an image that cannot honestly
+> carry the `xcode-26.6` capability label the mobile workflows gate on — while
+> three pins (`2026.07.2` here, `2026.07.4` in the zukan agent plist,
+> `2026.08.1` on the live host) disagreed. Both are deleted; one source of truth.
 
-The image (`ghcr.io/zukantechnologies/zukan-mobile-runner:<version>`) bakes the heavy toolchain: Cirrus macOS+Xcode base, Android SDK/NDK, JDK 17, Node 24, CocoaPods, fastlane, Go, Postgres 17, Maestro, and the Actions runner binary. Light deps (`npm ci`, `npx eas-cli`) install per-job.
+The image (`ghcr.io/zukantechnologies/zukan-mobile-runner:<version>`) bakes the heavy toolchain: macOS 26 Tahoe base + Xcode 26.6 (installed from a staged `.xip`), Android SDK/NDK, JDK 17, Node 24, CocoaPods, fastlane, Go, Postgres 17, Maestro, and the Actions runner binary. Light deps (`npm ci`, `npx eas-cli`) install per-job.
 
-The monorepo template additionally needs `~/XcodesCache/Xcode_26.6.xip` staged by
-hand before a build — Apple requires a developer account, so it cannot be
-fetched by the template (`xcodes download 26.6 --directory ~/XcodesCache`).
+Two traps worth knowing before you build it (both documented in full in zukan's `docs/mobile-cicd.md`):
 
-**Building** (human step, on any fleet Mac):
+- **`packer build` must run in the logged-in GUI (Aqua) session.** Over a plain SSH connection it hangs at `Waiting for SSH` until timeout — Tart needs the GUI session, the same constraint the agent has below. Drive it remotely via a one-shot LaunchAgent; `launchctl asuser` needs root.
+- **`no route to host` in the packer log is not a failure** — it's the guest booting, and the plugin recovers.
 
-```bash
-brew install jq
-brew trust cirruslabs/cli && brew install cirruslabs/cli/tart
-brew tap hashicorp/tap && brew install hashicorp/tap/packer
-brew install hudochenkov/sshpass/sshpass
-
-./packer/build.sh 2026.08.1            # build
-PUSH=1 ./packer/build.sh 2026.08.1     # …and push to GHCR (needs tart login with write:packages)
-```
-
-### ⚠️ Packer must run in the logged-in GUI (Aqua) session
-
-`packer build` **hangs at `Waiting for SSH` until it times out** when launched
-over a plain SSH connection. This is the same constraint the runner agent has —
-Tart drives `Virtualization.framework`, which needs a logged-in GUI session — but
-it is easy to miss here because "on any fleet Mac" reads like it can be driven
-remotely. It can, just not directly from an SSH shell.
-
-Sitting at the machine (or in a Screen Sharing session), the commands above work
-as written. To drive a build **remotely**, run it as a one-shot LaunchAgent,
-which executes inside the Aqua session:
-
-```bash
-# ~/Library/LaunchAgents/dev.zukan.packerbuild.plist — RunAtLoad, KeepAlive=false,
-# ProgramArguments = /bin/bash <a script that cd's to packer/ and runs build.sh>
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.zukan.packerbuild.plist
-tail -f <the plist's StandardOutPath>
-```
-
-`launchctl asuser $(id -u) …` is the obvious alternative and **does not work
-unprivileged** — it needs root (`Could not switch to audit session … Operation
-not permitted`), so on a host without passwordless sudo the LaunchAgent is the
-practical route.
-
-**Do not kill a run that is sitting on `no route to host`.** That message is the
-guest still booting; the plugin re-resolves the IP and recovers on its own
-(`handshake complete!` follows within a minute or so). Three otherwise-healthy
-builds were abandoned mid-flight before this was understood.
-
-### Host sizing
-
-`vm_memory_gb` defaults to **16**, which is unbuildable on a 16 GB Mac — the VM
-starves the host. On a 16 GB host, override:
-
-```bash
-PKR_VAR_vm_memory_gb=10 PKR_VAR_vm_cpu_count=6 ./packer/build.sh 2026.08.1
-```
-
-Disk: the build needs the base image plus a VM that grows to ~53 GB, so budget
-~110 GB free. Clones are APFS copy-on-write, so an *ephemeral* VM costs only its
-write-delta (~3 GB per job) — but `du` reports shared blocks against every file
-that references them, so it will read ~50 GB per clone. Trust
-`diskutil info / | grep "Container Free Space"` over `du` here.
-
-**Rollout**: open a PR bumping [`IMAGE_VERSION`](IMAGE_VERSION), merge, then re-run the installer on each host. The pin's git history is the fleet's image audit trail. Never point hosts at `latest`.
+**Rollout**: bump the version in zukan, rebuild, push to GHCR, then point each host's `BASE_IMAGE` at the new version. Never point hosts at `latest`.
 
 ## Manual provisioning runbook (interim)
 
@@ -143,9 +88,9 @@ brew install jq 1password-cli
 brew trust cirruslabs/cli && brew install cirruslabs/cli/tart
 brew install hudochenkov/sshpass/sshpass
 
-# 3. Base image (version from the IMAGE_VERSION file)
+# 3. Base image (version pinned in zukan — see docs/mobile-cicd.md)
 tart login ghcr.io --username <ghcr-pull-pat.username>   # paste ghcr-pull-pat.credential
-tart pull ghcr.io/zukantechnologies/zukan-mobile-runner:$(cat IMAGE_VERSION)
+tart pull ghcr.io/zukantechnologies/zukan-mobile-runner:<version>
 
 # 4. Agent
 sudo mkdir -p /opt/zukan && sudo chown "$(whoami)" /opt/zukan
@@ -191,9 +136,7 @@ tail -f /tmp/zukan-mobile-runner-agent.slot1.log
 |---|---|
 | `install.sh` | curl\|bash entrypoint *(lands in ZUK-2159)* |
 | `lib/` | installer internals + pure helpers *(ZUK-2158/2160/2161)* |
-| `IMAGE_VERSION` | the blessed image pin — bump via PR to roll out |
 | `agent/` | host slot-agent loop + launchd plist template |
-| `packer/` | base-image definition + build script |
 | `tests/` | bats suite (run in CI with shellcheck) |
 
 Planning artifacts (spec, plan, contracts, decision log): [`specs/027-mac-runner-bootstrap/`](https://github.com/ZukanTechnologies/zukan/blob/main/specs/027-mac-runner-bootstrap/spec.md) in the zukan monorepo. Fleet architecture narrative: zukan's `docs/mobile-cicd.md`.
