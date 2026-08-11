@@ -31,12 +31,20 @@ jobs:
 
   packer:
     # This repo owns the image template, so a syntax/reference error here is a
-    # broken fleet image — but the failure would otherwise only surface an hour
-    # into a build on a Mac, since Packer parses the template at build time.
-    # `validate` catches it in seconds on Linux. It does NOT build anything: no
-    # Tart, no macOS, no Apple credentials involved.
+    # broken fleet image — and it would otherwise only surface an hour into a
+    # build on a Mac, since Packer parses the template at build time.
+    #
+    # Runs on macOS, not Linux: packer-plugin-tart ships darwin/arm64 ONLY
+    # (Tart is Apple-Silicon-exclusive), so `packer init` on ubuntu fails with
+    # "could not find a local nor a remote checksum for plugin". This repo is
+    # public, so GitHub-hosted macOS minutes are free.
+    #
+    # This VALIDATES, it does not build: no VM boots, no Apple credentials, no
+    # .xip. (`-syntax-only` would run on Linux without the plugin, but it skips
+    # provisioner and variable checking — the weaker check isn't worth the
+    # weaker guarantee when the stronger one is free.)
     name: packer validate
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-packer@v3
