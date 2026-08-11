@@ -52,21 +52,18 @@ One vault, one read-only service account, two items. Full contract: [`specs/027-
 
 ## Base image
 
-> **⚠️ `packer/` in THIS repo is stale — do not build from it.**
+> **`packer/` in this repo is the source of truth for the image.**
 >
-> The live template is the zukan monorepo's
-> [`infra/mobile-ci/packer/`](https://github.com/ZukanTechnologies/zukan/tree/main/infra/mobile-ci/packer),
-> rewritten 2026-07-28 under ZUK-2131. The copy here predates that rewrite:
+> It was previously a pre-ZUK-2131 fork that built Xcode **26.5** while the zukan
+> monorepo's `infra/mobile-ci/packer/` built **26.6** — two copies, silently
+> divergent, and building from this one produced an image that could not honestly
+> carry the `xcode-26.6` capability label the mobile workflows gate on. The live
+> template has been ported here and the monorepo copy removed.
 >
-> | | this repo (stale) | monorepo (live) |
-> |---|---|---|
-> | base | `macos-tahoe-xcode:26.5` | `macos-tahoe-base:latest` |
-> | Xcode | whatever the prebuilt image ships (**26.5**) | installs **26.6** from a staged `.xip` |
->
-> Building from the copy here yields an Xcode **26.5** image, which cannot
-> honestly carry the `xcode-26.6` capability label the mobile workflows gate on —
-> and that gate exists precisely so a job can't land on too-old a toolchain.
-> Reconciling the two copies (one source of truth, not two) is outstanding.
+> The **agent** half (`agent/`) is deliberately NOT consolidated: hosts are
+> provisioned by [`troymccabe/setup`](https://github.com/troymccabe/setup) →
+> `mac/runner/setup`, and the zukan monorepo's `infra/mobile-ci/runner/` still
+> drives the Refractor host. This repo owns the image; it does not own the fleet.
 
 The image (`ghcr.io/zukantechnologies/zukan-mobile-runner:<version>`) bakes the heavy toolchain: Cirrus macOS+Xcode base, Android SDK/NDK, JDK 17, Node 24, CocoaPods, fastlane, Go, Postgres 17, Maestro, and the Actions runner binary. Light deps (`npm ci`, `npx eas-cli`) install per-job.
 

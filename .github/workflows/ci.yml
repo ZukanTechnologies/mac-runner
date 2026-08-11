@@ -28,3 +28,36 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
       - name: run test suite
         run: bats tests/
+
+  packer:
+    # This repo owns the image template, so a syntax/reference error here is a
+    # broken fleet image — but the failure would otherwise only surface an hour
+    # into a build on a Mac, since Packer parses the template at build time.
+    # `validate` catches it in seconds on Linux. It does NOT build anything: no
+    # Tart, no macOS, no Apple credentials involved.
+    name: packer validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-packer@v3
+        with:
+          version: latest
+      - name: packer init + fmt + validate
+        working-directory: packer
+        run: |
+          packer init .
+          packer fmt -check -diff .
+          # Two vars must be supplied for validation to resolve:
+          #   image_version — required, no default (build.sh passes it).
+          #   xcode_xip     — defaults to ~/XcodesCache/Xcode_26.6.xip, and
+          #                   `validate` PREPARES the `file` provisioner, which
+          #                   stat()s the source. That .xip is a manual,
+          #                   Apple-account-gated download that will never exist
+          #                   on a CI runner, so point it at a stub file.
+          #                   (Without this the job fails 100% of the time with
+          #                   "Bad source ...: no such file or directory".)
+          touch "$RUNNER_TEMP/stub.xip"
+          packer validate \
+            -var 'image_version=ci-validate' \
+            -var "xcode_xip=$RUNNER_TEMP/stub.xip" \
+            zukan-mobile-runner.pkr.hcl
