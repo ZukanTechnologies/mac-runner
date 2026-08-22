@@ -449,8 +449,13 @@ mr_host_runner_registered() {
   while [ "$page" -le 20 ]; do
     body="$(curl -fsS -H "Authorization: Bearer ${pat}" -H "Accept: application/vnd.github+json" \
       "https://api.github.com/orgs/${MR_GH_ORG}/actions/runners?per_page=100&page=${page}" 2>/dev/null)" || return 1
+    # Must be ONLINE, not merely present. Single-job JIT registrations are
+    # ephemeral and a VM killed mid-job leaves an offline entry behind, so a
+    # host that has ever worked keeps stale entries under its own name prefix
+    # forever — matching those would pass verification instantly on a host
+    # whose newly loaded agent never registers at all.
     if printf '%s' "$body" | jq -e --arg h "mobile-runner-${hosttag}-" \
-         '.runners // [] | map(select(.name | startswith($h))) | length > 0' >/dev/null 2>&1; then
+         '.runners // [] | map(select(.name | startswith($h)) | select(.status == "online")) | length > 0' >/dev/null 2>&1; then
       return 0
     fi
     count="$(printf '%s' "$body" | jq -r '.runners // [] | length' 2>/dev/null)"

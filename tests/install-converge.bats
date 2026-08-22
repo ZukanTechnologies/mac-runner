@@ -349,10 +349,32 @@ EOF
 
 # --- org runner lookup paginates (stale JIT entries accumulate) -------------
 
-@test "runners: a host runner on page 1 is found" {
-  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\"}]}"'
+@test "runners: an online host runner on page 1 is found" {
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\",\"status\":\"online\"}]}"'
   run mr_host_runner_registered fake-pat mymac
   [ "$status" -eq 0 ]
+}
+
+@test "runners: a STALE OFFLINE entry from a previous install does not count" {
+  # Single-job JIT registrations are ephemeral and a VM killed mid-job leaves
+  # an offline entry behind, so a host that has ever worked keeps entries
+  # under its own name prefix forever. Accepting those would pass
+  # verification instantly on a host whose new agent never registers.
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1600\",\"status\":\"offline\"}]}"'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -ne 0 ]
+}
+
+@test "runners: a live runner alongside stale offline ones is found" {
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1600\",\"status\":\"offline\"},{\"name\":\"mobile-runner-mymac-2-1712\",\"status\":\"online\"}]}"'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -eq 0 ]
+}
+
+@test "runners: another host's online runner is not ours" {
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-otherhost-1-1712\",\"status\":\"online\"}]}"'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -ne 0 ]
 }
 
 @test "runners: a host runner on page 2 is found — the listing is paginated" {
@@ -373,7 +395,7 @@ EOF
         done
         printf "]}" ;;
       *"&page=2"*)
-        printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\"}]}" ;;
+        printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\",\"status\":\"online\"}]}" ;;
     esac'
   run mr_host_runner_registered fake-pat mymac
   [ "$status" -eq 0 ]
