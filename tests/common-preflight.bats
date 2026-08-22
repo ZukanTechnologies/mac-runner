@@ -228,14 +228,14 @@ teardown() {
 
 @test "image size: the named local image's size is read from the tart listing" {
   printf '%s' '[{"Source":"local","Name":"zukan-mobile-runner-2026.08.1","Size":64,"State":"stopped"}]' > "$TEST_TMP/tart.json"
-  run mr_local_image_size_gb zukan-mobile-runner-2026.08.1 < "$TEST_TMP/tart.json"
+  run mr_image_size_gb zukan-mobile-runner-2026.08.1 < "$TEST_TMP/tart.json"
   [ "$status" -eq 0 ]
   [ "$output" = "64" ]
 }
 
 @test "image size: an image that is not on the host reports nothing" {
   printf '%s' '[]' > "$TEST_TMP/tart.json"
-  run mr_local_image_size_gb zukan-mobile-runner-2026.08.1 < "$TEST_TMP/tart.json"
+  run mr_image_size_gb zukan-mobile-runner-2026.08.1 < "$TEST_TMP/tart.json"
   [ "$status" -ne 0 ]
   [ "$output" = "" ]
 }

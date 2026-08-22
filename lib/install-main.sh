@@ -195,7 +195,7 @@ mr_converge_image() {
   done | head -1)"
   have_size=""
   if [ -n "$existing" ]; then
-    have_size="$(printf '%s' "$listing" | mr_local_image_size_gb "$existing")" || have_size=""
+    have_size="$(printf '%s' "$listing" | mr_image_size_gb "$existing")" || have_size=""
   fi
   need="$(mr_disk_requirement_gb "$have_size" "$MR_DISK_FLOOR_GB")" || need="$MR_DISK_FLOOR_GB"
   free="$(mr_free_disk_gb /)" || free=""

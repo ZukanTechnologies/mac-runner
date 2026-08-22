@@ -425,20 +425,20 @@ mr_running_ci_vm_names() {
   jq -r '.[] | select(.State == "running") | select(.Name | startswith("ci-")) | .Name'
 }
 
-mr_local_image_names() {
-  jq -r '.[] | select(.Source == "local") | .Name'
-}
-
-# Every entry tart knows about, local VMs and OCI-cache images alike. This is
-# what the presence and prune checks read: the pinned image lives in the OCI
-# cache, so a Source == "local" filter would never see it.
+# Every entry tart knows about, local VMs and OCI-cache images alike.
+#
+# There is deliberately no Source == "local" variant. The pinned image lives in
+# the OCI cache, so a local-only filter cannot see it — that filter is what hid
+# the pulled image from the presence check in the first place, and a helper
+# sitting here offering it again is an invitation to repeat that.
 mr_image_names() {
   jq -r '.[] | .Name'
 }
 
-# Size in GB of one local image, from the same JSON. Empty when tart does not
+# Size in GB of one image, from the same JSON — any source, for the same
+# reason mr_image_names has no local-only variant. Empty when tart does not
 # know the image (nothing pulled yet).
-mr_local_image_size_gb() {
+mr_image_size_gb() {
   local name="$1" out
   [ -n "$name" ] || return 1
   out="$(jq -r --arg n "$name" '.[] | select(.Name == $n) | .Size' 2>/dev/null)"

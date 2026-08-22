@@ -289,18 +289,10 @@ json_fixture() {
   [ "$output" = "" ]
 }
 
-@test "tart: local image names are extracted, remote entries skipped" {
-  json_fixture '[{"Source":"local","Name":"zukan-mobile-runner-2026.08.1","State":"stopped"},
-                 {"Source":"oci","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
-  run mr_local_image_names < "$TEST_TMP/tart.json"
-  [ "${#lines[@]}" -eq 1 ]
-  [ "${lines[0]}" = "zukan-mobile-runner-2026.08.1" ]
-}
-
 @test "tart: every entry is listed regardless of source" {
   # The pinned image lives in the OCI cache, so anything that filters on
   # Source == "local" cannot see it — which is why presence and prune read
-  # mr_image_names, not mr_local_image_names.
+  # mr_image_names — there is deliberately no local-only variant.
   json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","State":"running"},
                  {"Source":"oci","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
   run mr_image_names < "$TEST_TMP/tart.json"
