@@ -385,3 +385,25 @@ json_fixture() {
   run mr_summary_changed_anything
   [ "$status" -eq 0 ]
 }
+
+# --- ownership: only OUR registry's images are ours -------------------------
+
+@test "version-of: another org's image with the same name is NOT ours" {
+  # This answer feeds the prune list. A suffix match on "zukan-mobile-runner:"
+  # would classify — and then delete — an unrelated org's image.
+  run mr_image_version_of "ghcr.io/someone-else/zukan-mobile-runner:2026.07.4"
+  [ "$status" -ne 0 ]
+}
+
+@test "version-of: another registry entirely is NOT ours" {
+  run mr_image_version_of "registry.example.com/zukantechnologies/zukan-mobile-runner:2026.07.4"
+  [ "$status" -ne 0 ]
+}
+
+@test "prune: another org's identically-named image is never pruned" {
+  names ghcr.io/someone-else/zukan-mobile-runner:2026.07.4 \
+        ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
+  [ "${#lines[@]}" -eq 1 ]
+  [ "${lines[0]}" = "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4" ]
+}

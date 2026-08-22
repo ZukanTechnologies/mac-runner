@@ -114,11 +114,28 @@ bs_preflight() {
 
 # The one human-remediable step that can't be scripted without an undocumented
 # OS hack (FR-005 forbids the kcpassword route), so: pause, guide, re-check.
+# Auto-login must name the account running this installer, not merely *an*
+# account. The slot agents are LaunchAgents in ~/Library/LaunchAgents and load
+# only in that user's GUI session — so a Mac that auto-logs in as somebody else
+# comes back from a reboot with no runner at all, and nothing about it looks
+# broken until jobs stop being picked up.
+bs_autologin_matches_me() {
+  local user me
+  user="$(bs_autologin_user)" || return 1
+  me="$(id -un)"
+  [ "$user" = "$me" ]
+}
+
 bs_require_autologin() {
-  local user
-  if user="$(bs_autologin_user)"; then
-    bs_log "auto-login: enabled for '${user}'"
+  local user me
+  me="$(id -un)"
+  if bs_autologin_matches_me; then
+    bs_log "auto-login: enabled for '${me}'"
     return 0
+  fi
+  if user="$(bs_autologin_user)"; then
+    bs_err "auto-login is set to '${user}', but this installer is running as '${me}' and its slot agents load only in ${me}'s GUI session. Set auto-login to '${me}' in System Settings -> Users & Groups (or re-run this command as '${user}'), then try again."
+    return "$MR_EXIT_REMEDIABLE"
   fi
   cat <<EOF
 
@@ -139,11 +156,11 @@ EOF
     bs_err "aborted at the auto-login step. Nothing was changed. Re-run the same command to resume."
     return "$MR_EXIT_REMEDIABLE"
   }
-  if user="$(bs_autologin_user)"; then
-    bs_log "auto-login: enabled for '${user}'"
+  if bs_autologin_matches_me; then
+    bs_log "auto-login: enabled for '${me}'"
     return 0
   fi
-  bs_err "auto-login still is not set. Set it in System Settings -> Users & Groups, then re-run the same command."
+  bs_err "auto-login is still not set to '${me}'. Set it in System Settings -> Users & Groups, then re-run the same command."
   return "$MR_EXIT_REMEDIABLE"
 }
 

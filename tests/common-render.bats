@@ -238,3 +238,42 @@ teardown() {
   run mr_plist_label 2
   [ "$output" = "com.zukan.mobile-runner-agent.slot2" ]
 }
+
+# --- GH_ORG reaches the agent ----------------------------------------------
+
+@test "pin: trailing blank lines are tolerated, a second value is not" {
+  # $(cat file) strips trailing newlines, so counting lines after it would
+  # accept a file with blank lines while claiming to enforce one line. The
+  # check counts non-empty lines instead: blank padding is harmless, two
+  # versions are two answers.
+  printf '2026.08.1\n\n\n' > "$PIN_FILE"
+  run mr_read_pin "$PIN_FILE"
+  [ "$status" -eq 0 ]
+  [ "$output" = "2026.08.1" ]
+
+  printf '2026.08.1\n\n2026.07.4\n' > "$PIN_FILE"
+  run mr_read_pin "$PIN_FILE"
+  [ "$status" -ne 0 ]
+}
+
+@test "render: GH_ORG lands in the plist so the agent registers where the installer verified" {
+  # GH_ORG is a documented env override used for the post-install verification.
+  # If it never reached the agent's environment, the installer would check one
+  # org while every runner silently registered with the default one.
+  run mr_render_plist "$TMPL" 1 img "" /tmp/slot1.log "SomeOtherOrg"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"<key>GH_ORG</key>"* ]]
+  [[ "$output" == *"<string>SomeOtherOrg</string>"* ]]
+}
+
+@test "render: GH_ORG defaults to ZukanTechnologies when not passed" {
+  run mr_render_plist "$TMPL" 1 img "" /tmp/slot1.log
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"<string>ZukanTechnologies</string>"* ]]
+  [[ "$output" != *"{{"* ]]
+}
+
+@test "render: an XML-unsafe org is rejected like any other value" {
+  run mr_render_plist "$TMPL" 1 img "" /tmp/slot1.log "a&b"
+  [ "$status" -ne 0 ]
+}

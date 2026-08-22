@@ -15,7 +15,7 @@ One paste of the 1Password service-account token, at most one System Settings to
 ## Prerequisites (fresh Mac)
 
 1. Apple-Silicon Mac, macOS 15+, ~120 GB free.
-2. Complete Setup Assistant as the CI user. **Decline FileVault** — auto-login is impossible while disk encryption is on, and Tart requires an unlocked `login.keychain` in a logged-in GUI session (macOS Virtualization framework behavior).
+2. Complete Setup Assistant as the CI user, and run the installer as that same user. **Decline FileVault** — auto-login is impossible while disk encryption is on, and Tart requires an unlocked `login.keychain` in a logged-in GUI session (macOS Virtualization framework behavior).
 3. Have the `mac-runner-hosts` 1Password **service-account token** at hand (see [Credentials](#credentials-1password)).
 
 ## Configuration (env overrides)
@@ -40,7 +40,7 @@ SLOTS=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZukanTechno
 It converges the host — observe, then change only what differs — in this order:
 
 1. **Preflight**, read-only: Apple Silicon, macOS 15+, FileVault off, free disk. Nothing on the host changes until all of these pass.
-2. **Auto-login**: if unset, prints the exact System Settings path and waits. This is the one manual step; it cannot be scripted without an undocumented OS hack, which this repo will not do.
+2. **Auto-login**: if unset, prints the exact System Settings path and waits. This is the one manual step; it cannot be scripted without an undocumented OS hack, which this repo will not do. It must name **the account you run the installer as** — slot agents are LaunchAgents that load only in that user's GUI session, so a Mac auto-logging in as someone else comes back from a reboot with no runner and no visible sign of it.
 3. **Toolchain**: `sudo pmset` (no sleep), Homebrew, `jq`, `1password-cli`, `cirruslabs/cli/tart`, `sshpass`.
 4. **Itself**: clones/updates this repo to `/opt/zukan/mac-runner` and re-execs from there, so one run uses one consistent revision.
 5. **Secrets**: prompts once for the service-account token, stores it `0600`, validates it, signs in to `ghcr.io` with the op-read pull PAT.

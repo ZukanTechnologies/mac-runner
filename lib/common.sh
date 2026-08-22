@@ -176,12 +176,18 @@ mr_read_pin() {
     return 1
   fi
 
-  raw="$(cat "$file")"
-  extra="$(printf '%s' "$raw" | wc -l | tr -d '[:space:]')"
-  if [ "$extra" != "0" ]; then
-    mr_err "image pin file must hold exactly one version, found more than one line: ${file}"
+  # Count NON-EMPTY lines, read from the file rather than from a command
+  # substitution: `$(cat …)` strips trailing newlines, so counting after it
+  # would accept "2026.08.1\n\n\n" as single-line while the check claims to
+  # enforce one line. Trailing blank lines are harmless and tolerated; a second
+  # VALUE is two answers and is refused.
+  extra="$(grep -c '[^[:space:]]' "$file" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$extra" ] || [ "$extra" -gt 1 ]; then
+    mr_err "image pin file must hold exactly one version, found ${extra:-0} values: ${file}"
     return 1
   fi
+
+  raw="$(cat "$file")"
 
   value="$(mr_trim "$raw")"
   if [ -z "$value" ]; then
@@ -232,12 +238,20 @@ mr_base_image_name() {
 
 # The version an image name refers to, in either shape; non-zero when the name
 # is not one of ours (an ephemeral `ci-*` clone, or somebody else's VM).
+#
+# The OCI shape is matched against the FULL registry prefix, not just a
+# trailing "zukan-mobile-runner:". This answer feeds the prune list, and a
+# suffix match would classify `ghcr.io/someone-else/zukan-mobile-runner:X` as
+# ours and delete it.
 mr_image_version_of() {
   local name="$1"
   case "$name" in
-    "${MR_IMAGE_PREFIX}"-*)  printf '%s\n' "${name#"${MR_IMAGE_PREFIX}"-}" ;;
-    *"${MR_IMAGE_PREFIX}":*) printf '%s\n' "${name##*:}" ;;
-    *) return 1 ;;
+    "${MR_IMAGE_PREFIX}"-*)
+      printf '%s\n' "${name#"${MR_IMAGE_PREFIX}"-}" ;;
+    "${MR_REGISTRY}/${MR_IMAGE_PREFIX}":*)
+      printf '%s\n' "${name##*:}" ;;
+    *)
+      return 1 ;;
   esac
 }
 
@@ -301,7 +315,7 @@ mr_value_is_renderable() {
 }
 
 mr_render_plist() {
-  local tmpl="$1" slot="$2" image="$3" labels="$4" log_path="$5" v out
+  local tmpl="$1" slot="$2" image="$3" labels="$4" log_path="$5" org="${6:-ZukanTechnologies}" v out
 
   mr_validate_slots "$slot" || return 1
   if [ ! -r "$tmpl" ]; then
@@ -309,7 +323,7 @@ mr_render_plist() {
     return 1
   fi
 
-  for v in "$image" "$labels" "$log_path"; do
+  for v in "$image" "$labels" "$log_path" "$org"; do
     if ! mr_value_is_renderable "$v"; then
       mr_err "refusing to render slot ${slot}: value contains a character that would break the plist XML ('${v}')"
       return 1
@@ -320,6 +334,7 @@ mr_render_plist() {
              -e "s|{{BASE_IMAGE}}|${image}|g" \
              -e "s|{{EXTRA_LABELS}}|${labels}|g" \
              -e "s|{{LOG_PATH}}|${log_path}|g" \
+             -e "s|{{GH_ORG}}|${org}|g" \
              "$tmpl")" || return 1
 
   case "$out" in

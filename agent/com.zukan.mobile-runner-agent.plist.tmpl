@@ -5,7 +5,7 @@
 
   Rendered by the mac-runner installer, one copy per VM slot ({{SLOT}} = 1..2;
   Apple's Virtualization framework allows max 2 concurrent VMs per host).
-  Placeholders: {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}}.
+  Placeholders: {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}} {{GH_ORG}}.
   Substituted values sit inside XML <string> elements — the renderer must
   reject values containing & < > (the installer's render helper enforces
   this; ZUK-2158).
@@ -40,6 +40,11 @@
     <string>{{BASE_IMAGE}}</string>
     <key>RUNNER_EXTRA_LABELS</key>
     <string>{{EXTRA_LABELS}}</string>
+    <!-- The org the agent JIT-registers runners with. Rendered from the
+         installer's GH_ORG so the org it verified against and the org the
+         agent actually registers to cannot diverge. -->
+    <key>GH_ORG</key>
+    <string>{{GH_ORG}}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>

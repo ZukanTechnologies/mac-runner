@@ -181,9 +181,10 @@ both_agree() {
 }
 
 @test "gate: a host with auto-login already on does not pause" {
+  mr_stub defaults "echo $(id -un)"
   run bs_require_autologin
   [ "$status" -eq 0 ]
-  [[ "$output" == *"enabled for 'ci'"* ]]
+  [[ "$output" == *"enabled for '$(id -un)'"* ]]
 }
 
 # --- 1Password error classification (shared with the installer) ------------
@@ -203,4 +204,30 @@ both_agree() {
   # wait — so a network blip must not send an operator off rotating secrets.
   run mr_op_error_class "error: connection refused"
   [ "$output" = "unreachable" ]
+}
+
+# --- auto-login must name the account that will own the LaunchAgents --------
+
+@test "autologin: a different user's auto-login is rejected, not accepted" {
+  # The slot agents live in ~/Library/LaunchAgents and load only in that
+  # user's GUI session. A Mac that auto-logs in as someone else comes back
+  # from a reboot with no runner, and nothing about it looks broken.
+  mr_stub defaults 'echo somebody-else'
+  run bs_require_autologin
+  [ "$status" -eq 11 ]
+  [[ "$output" == *"somebody-else"* ]]
+  [[ "$output" == *"$(id -un)"* ]]
+}
+
+@test "autologin: the installing user's own auto-login is accepted" {
+  mr_stub defaults "echo $(id -un)"
+  run bs_require_autologin
+  [ "$status" -eq 0 ]
+}
+
+@test "gate: a mismatched auto-login stops the install before any change" {
+  mr_stub defaults 'echo somebody-else'
+  run bash -c "$(cat "$REPO/install.sh")" < /dev/null
+  [ "$status" -eq 11 ]
+  [[ "$output" != *"REFUSED"* ]]
 }

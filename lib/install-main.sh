@@ -332,7 +332,7 @@ mr_converge_slots() {
   for slot in $(seq 1 "$slots"); do
     path="$(mr_plist_path "$slot")"
     log_path="$(mr_default_log_path "$slot")"
-    rendered="$(mr_render_plist "$MR_PLIST_TMPL" "$slot" "$image" "$labels" "$log_path")" || {
+    rendered="$(mr_render_plist "$MR_PLIST_TMPL" "$slot" "$image" "$labels" "$log_path" "$MR_GH_ORG")" || {
       mr_err "could not render the launchd plist for slot ${slot}. Nothing was loaded; re-running this command is safe."
       return "$MR_EXIT_CONVERGE"
     }
