@@ -484,3 +484,14 @@ EOF
   [ "$status" -eq 11 ]
   [[ "$output" == *"refused rather than started blind"* ]]
 }
+
+@test "guard: a long wait reports progress instead of looking hung" {
+  # The contract asks for a countdown; a silent 45-minute wait is
+  # indistinguishable from a hang.
+  mr_stub tart 'echo "[{\"Source\":\"local\",\"Name\":\"ci-mini-1-1712\",\"Running\":true,\"State\":\"running\"}]"'
+  mr_stub sleep 'exit 0'
+  export MR_INFLIGHT_TIMEOUT_S=600
+  run mr_wait_for_idle
+  [ "$status" -eq 30 ]
+  [[ "$output" == *"min left before giving up"* ]]
+}

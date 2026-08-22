@@ -335,7 +335,14 @@ mr_wait_for_idle() {
       mr_err "still ${running} CI job(s) running on this host after $((waited / 60)) minutes. Wait and re-run, or re-run with FORCE=1 to terminate them (they retry automatically)."
       return "$MR_EXIT_CONVERGE"
     fi
-    [ "$waited" -eq 0 ] && mr_log "slots: ${running} CI job(s) in flight — waiting for them to finish (FORCE=1 skips this and terminates them)"
+    # The contract calls for a countdown, and a 45-minute silent wait looks
+    # indistinguishable from a hang: announce once, then tick every 5 minutes
+    # with the time left.
+    if [ "$waited" -eq 0 ]; then
+      mr_log "slots: ${running} CI job(s) in flight — waiting for them to finish (FORCE=1 skips this and terminates them)"
+    elif [ $((waited % 300)) -eq 0 ]; then
+      mr_log "slots: still ${running} in flight; $(( (MR_INFLIGHT_TIMEOUT_S - waited) / 60 )) min left before giving up"
+    fi
     sleep 15
     waited=$((waited + 15))
   done
