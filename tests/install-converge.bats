@@ -390,3 +390,97 @@ EOF
   run mr_host_runner_registered fake-pat mymac
   [ "$status" -ne 0 ]
 }
+
+# --- the guard must not read "cannot tell" as "idle" ------------------------
+
+@test "guard: an unreadable tart listing is not counted as zero" {
+  # 0 is the answer that tells the guard it is safe to restart the slots. A
+  # broken or transiently failing tart must not produce it.
+  mr_stub tart 'exit 2'
+  run mr_count_running_ci_vms
+  [ "$status" -ne 0 ]
+}
+
+@test "guard: empty tart output is also 'unknown', not 'idle'" {
+  mr_stub tart 'printf ""'
+  run mr_count_running_ci_vms
+  [ "$status" -ne 0 ]
+}
+
+@test "guard: an unreadable listing retries, then FAILS CLOSED" {
+  # The guard exists to avoid killing a running CI job. "I cannot tell" is
+  # exactly when proceeding is unsafe: stopping costs a re-run, guessing wrong
+  # costs somebody's job.
+  mr_stub tart 'exit 2'
+  mr_stub sleep 'exit 0'
+  run mr_wait_for_idle
+  [ "$status" -eq 30 ]
+  [[ "$output" == *"retrying"* ]]
+  [[ "$output" == *"refused rather than done blind"* ]]
+}
+
+@test "guard: FORCE=1 is the documented override for an unreadable listing" {
+  mr_stub tart 'exit 2'
+  mr_stub sleep 'exit 0'
+  export FORCE=1
+  run mr_wait_for_idle
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FORCE=1"* ]]
+}
+
+@test "guard: FORCE=1 actually stops and deletes the in-flight VMs" {
+  # It used to only PRINT that it was terminating them. On an otherwise
+  # converged host nothing else restarts a slot, so the install reported
+  # success while the VM kept running.
+  mr_stub tart '
+    printf "%s\n" "$*" >> "$STUB_STATE_DIR/tart.log"
+    case "$1" in
+      list) echo "[{\"Source\":\"local\",\"Name\":\"ci-mini-1-1712\",\"Running\":true,\"State\":\"running\"}]" ;;
+    esac
+    exit 0'
+  export FORCE=1
+  run mr_wait_for_idle
+  [ "$status" -eq 0 ]
+  local log
+  log="$(cat "$STUB_STATE_DIR/tart.log")"
+  [[ "$log" == *"stop ci-mini-1-1712"* ]]
+  [[ "$log" == *"delete ci-mini-1-1712"* ]]
+}
+
+@test "guard: without FORCE nothing is terminated" {
+  mr_stub tart '
+    printf "%s\n" "$*" >> "$STUB_STATE_DIR/tart.log"
+    case "$1" in
+      list) echo "[{\"Source\":\"local\",\"Name\":\"ci-mini-1-1712\",\"Running\":true,\"State\":\"running\"}]" ;;
+    esac
+    exit 0'
+  mr_stub sleep 'exit 0'
+  export MR_INFLIGHT_TIMEOUT_S=30
+  run mr_wait_for_idle
+  [ "$status" -eq 30 ]
+  local log
+  log="$(cat "$STUB_STATE_DIR/tart.log")"
+  [[ "$log" != *"delete"* ]]
+}
+
+@test "guard: a listing that recovers on retry is read normally" {
+  mr_stub tart '
+    n_file="$STUB_STATE_DIR/tart-calls"
+    n=$(( $(cat "$n_file" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$n_file"
+    [ "$n" -lt 2 ] && exit 2
+    echo "[]"'
+  mr_stub sleep 'exit 0'
+  run mr_wait_for_idle
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"refused rather than done blind"* ]]
+}
+
+@test "image: an unreadable df refuses the pull instead of starting it blind" {
+  # This gates a tens-of-GB download; an unreadable `df` is not permission.
+  mr_stub tart 'echo "[]"'
+  mr_stub df 'exit 1'
+  run mr_converge_image 2026.08.1
+  [ "$status" -eq 11 ]
+  [[ "$output" == *"refused rather than started blind"* ]]
+}

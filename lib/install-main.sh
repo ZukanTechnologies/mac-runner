@@ -212,8 +212,13 @@ mr_converge_image() {
     have_size="$(printf '%s' "$listing" | mr_image_size_gb "$existing")" || have_size=""
   fi
   need="$(mr_disk_requirement_gb "$have_size" "$MR_DISK_FLOOR_GB")" || need="$MR_DISK_FLOOR_GB"
-  free="$(mr_free_disk_gb /)" || free=""
-  if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
+  # Fails closed for the same reason the in-flight guard does: this gates a
+  # tens-of-GB download, and an unreadable `df` is not permission to start it.
+  if ! free="$(mr_free_disk_gb /)"; then
+    mr_err "could not read free disk space, so the ${ref} pull is refused rather than started blind. Check 'df -g /' and re-run this command."
+    return "$MR_EXIT_REMEDIABLE"
+  fi
+  if [ "$free" -lt "$need" ]; then
     mr_err "not enough free disk to pull ${ref}: need ~${need} GB, have ${free} GB. The previous image is only removed after the new one is running, so both must fit. Free some space, then re-run this command."
     return "$MR_EXIT_REMEDIABLE"
   fi
@@ -261,14 +266,59 @@ EOF
 
 # --- in-flight guard (FR-008) -----------------------------------------------
 
+# Prints the number of running ci-* VMs. Returns NON-ZERO when the listing
+# could not be read at all — "I don't know" must not be reported as "0",
+# because 0 is what tells the guard it is safe to restart the slots.
 mr_count_running_ci_vms() {
-  mr_tart_json | mr_running_ci_vm_names | grep -c . || true
+  local listing
+  listing="$(mr_tart_json)" || return 1
+  [ -n "$listing" ] || return 1
+  printf '%s' "$listing" | mr_running_ci_vm_names | grep -c . || true
+}
+
+# Actually stop and delete the running ci-* clones.
+#
+# Without this, FORCE=1 only PRINTED that it was terminating them: on an
+# otherwise converged host, mr_converge_slots finds matching plists and loaded
+# agents, changes nothing, and the install reports success while the in-flight
+# VM keeps running. The announcement has to be true.
+mr_terminate_ci_vms() {
+  local vm
+  for vm in $(mr_tart_json | mr_running_ci_vm_names); do
+    [ -n "$vm" ] || continue
+    mr_log "slots: terminating ${vm}"
+    tart stop "$vm" >/dev/null 2>&1 || true
+    tart delete "$vm" >/dev/null 2>&1 || mr_warn "could not delete ${vm}; it will be recycled by its slot agent"
+    mr_summary_add removed "in-flight VM ${vm}"
+  done
+  return 0
 }
 
 mr_wait_for_idle() {
-  local waited=0 running action
+  local waited=0 running action unknown=0
   while :; do
-    running="$(mr_count_running_ci_vms)"
+    if ! running="$(mr_count_running_ci_vms)"; then
+      # tart should be working by now — the toolchain and image steps both
+      # used it moments ago — so this is most likely transient. Retry a few
+      # times rather than either blocking for the full timeout or treating an
+      # unreadable host as idle and tearing down a live job.
+      unknown=$((unknown + 1))
+      if [ "$unknown" -le 3 ]; then
+        mr_warn "could not read 'tart list' to check for in-flight jobs (attempt ${unknown}/3); retrying"
+        sleep 5
+        continue
+      fi
+      if [ "${FORCE:-0}" = "1" ]; then
+        mr_warn "still cannot read 'tart list', but FORCE=1 — restarting slots anyway"
+        return 0
+      fi
+      # Fails CLOSED. The guard exists to avoid killing a running CI job, and
+      # "I cannot tell" is exactly when proceeding is unsafe. Stopping costs a
+      # re-run; guessing wrong costs somebody's job.
+      mr_err "cannot read 'tart list' to tell whether a CI job is running on this host, so the slot restart is refused rather than done blind. Re-run this command, or re-run with FORCE=1 to restart regardless."
+      return "$MR_EXIT_CONVERGE"
+    fi
+    unknown=0
     action="$(mr_inflight_action "$running" "${FORCE:-0}")"
     case "$action" in
       proceed)
@@ -277,6 +327,7 @@ mr_wait_for_idle() {
         ;;
       force)
         mr_log "slots: FORCE=1 — terminating ${running} in-flight CI VM(s); their jobs are ephemeral and retry on the next cycle"
+        mr_terminate_ci_vms
         return 0
         ;;
     esac
