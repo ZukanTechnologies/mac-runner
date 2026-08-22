@@ -95,12 +95,28 @@ mr_prompt_for_token() {
   stty echo 2>/dev/null
   printf '\n' >&2
   [ -n "$token" ] || { mr_err "no token entered. Re-run this command when you have it."; return 1; }
+  mr_write_token "$token"
+}
 
-  mkdir -p "$(dirname "$MR_TOKEN_FILE")" || return 1
-  # Create with the right mode before writing: a world-readable moment is
-  # still a leak, and this file is the ONLY secret at rest on the host.
-  ( umask 077; printf '%s\n' "$token" > "$MR_TOKEN_FILE" ) || return 1
-  chmod 600 "$MR_TOKEN_FILE" || return 1
+# The only place the token file is ever written. Creates under umask 077, sets
+# the mode explicitly, CHECKS that it took, and renames into place — so there
+# is never a moment where the real path exists with loose permissions, and a
+# failed chmod cannot be mistaken for a securely stored token. This file is the
+# one secret at rest on the host (FR-009).
+mr_write_token() {
+  local value="$1" tmp
+  mkdir -p "$(dirname "$MR_TOKEN_FILE")" || {
+    mr_err "could not create $(dirname "$MR_TOKEN_FILE")"
+    return 1
+  }
+  tmp="${MR_TOKEN_FILE}.new.$$"
+  ( umask 077; printf '%s\n' "$value" > "$tmp" ) || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || {
+    mr_err "could not set owner-only permissions on the token file; refusing to store it"
+    rm -f "$tmp"
+    return 1
+  }
+  mv -f "$tmp" "$MR_TOKEN_FILE" || { rm -f "$tmp"; return 1; }
   return 0
 }
 
@@ -112,9 +128,7 @@ mr_converge_secrets() {
     if [ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
       # Scripted path (documented in the CLI contract): pre-supplying the token
       # skips the prompt entirely.
-      mkdir -p "$(dirname "$MR_TOKEN_FILE")" || return "$MR_EXIT_SECRETS"
-      ( umask 077; printf '%s\n' "$OP_SERVICE_ACCOUNT_TOKEN" > "$MR_TOKEN_FILE" ) || return "$MR_EXIT_SECRETS"
-      chmod 600 "$MR_TOKEN_FILE"
+      mr_write_token "$OP_SERVICE_ACCOUNT_TOKEN" || return "$MR_EXIT_SECRETS"
     else
       mr_prompt_for_token || return "$MR_EXIT_SECRETS"
     fi
@@ -180,8 +194,8 @@ mr_converge_image() {
   ref="$(mr_base_image_ref "$version")"
   listing="$(mr_tart_json)"
 
-  if printf '%s' "$listing" | mr_image_names 2>/dev/null | mr_image_present "$version"; then
-    mr_log "image: ${version} already present"
+  if printf '%s' "$listing" | mr_image_names 2>/dev/null | mr_image_ref_present "$ref"; then
+    mr_log "image: ${ref} already present"
     mr_summary_add unchanged "image ${ref}"
     return 0
   fi
@@ -366,6 +380,31 @@ mr_converge_slots() {
 # correctly rendered plist contains the string. Checked here the way
 # mr_plist_is_legacy does it — the launchd KEY — plus a scan for anything that
 # looks like an actual GitHub token value, which is the real concern.
+# Does the org listing show a runner from this host?
+#
+# Paginates. Single-job JIT registrations are ephemeral by construction and a
+# VM killed mid-job leaves an offline entry behind, so the org listing
+# accumulates stale runners — checking only the first 100 would report a
+# healthy host as failed (exit 40) once the fleet had churned enough.
+mr_host_runner_registered() {
+  local pat="$1" hosttag="$2" page=1 body count
+  while [ "$page" -le 20 ]; do
+    body="$(curl -fsS -H "Authorization: Bearer ${pat}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/orgs/${MR_GH_ORG}/actions/runners?per_page=100&page=${page}" 2>/dev/null)" || return 1
+    if printf '%s' "$body" | jq -e --arg h "mobile-runner-${hosttag}-" \
+         '.runners // [] | map(select(.name | startswith($h))) | length > 0' >/dev/null 2>&1; then
+      return 0
+    fi
+    count="$(printf '%s' "$body" | jq -r '.runners // [] | length' 2>/dev/null)"
+    case "$count" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$count" -lt 100 ] && return 1
+    page=$((page + 1))
+  done
+  return 1
+}
+
 mr_verify_no_credentials_at_rest() {
   local dir mode ok=0 offenders
   dir="$(mr_launch_agents_dir)"
@@ -427,10 +466,10 @@ mr_verify_no_leftovers() {
 mr_verify() {
   local slots="$1" version="$2" slot failures=0 pat waited hosttag
 
-  if mr_tart_json | mr_image_names | mr_image_present "$version"; then
-    mr_log "verify: image ${version} present"
+  if mr_tart_json | mr_image_names | mr_image_ref_present "$(mr_base_image_ref "$version")"; then
+    mr_log "verify: image $(mr_base_image_ref "$version") present"
   else
-    mr_err "verify: image ${version} is not on this host"
+    mr_err "verify: $(mr_base_image_ref "$version") is not on this host — the agents clone that reference, so a bare local copy of the same version is not a substitute"
     failures=$((failures + 1))
   fi
 
@@ -466,10 +505,7 @@ mr_verify() {
   if pat="$(mr_op_read "op://${MR_VAULT}/runner-jit-pat/credential")"; then
     waited=0
     while [ "$waited" -lt "$MR_VERIFY_TIMEOUT_S" ]; do
-      if curl -fsS -H "Authorization: Bearer ${pat}" -H "Accept: application/vnd.github+json" \
-           "https://api.github.com/orgs/${MR_GH_ORG}/actions/runners?per_page=100" 2>/dev/null \
-         | jq -e --arg h "mobile-runner-${hosttag}-" \
-             '.runners // [] | map(select(.name | startswith($h))) | length > 0' >/dev/null 2>&1; then
+      if mr_host_runner_registered "$pat" "$hosttag"; then
         mr_log "verify: this host has a runner registered with ${MR_GH_ORG}"
         break
       fi

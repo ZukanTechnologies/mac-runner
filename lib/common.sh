@@ -255,14 +255,23 @@ mr_image_version_of() {
   esac
 }
 
-# Is the pinned version on this host, in either shape? Reads names on stdin.
-mr_image_present() {
-  local want="$1" name v
+# Is the exact reference the agents clone from on this host? Reads names on
+# stdin.
+#
+# Deliberately an EXACT match on the reference, not "some shape of this
+# version". A host that already has the bare local VM — the Mac that built the
+# image, or one provisioned before the pull/clone distinction was understood —
+# has nothing the agent can use: the plist says clone the registry reference,
+# and that reference is not in the OCI cache. Accepting the bare name here
+# would skip the GHCR login and pull, and the first agent cycle would then try
+# to fetch the image itself with no registry credentials established. So the
+# bare name means "still needs pulling", which is exactly right.
+mr_image_ref_present() {
+  local want="$1" name
   [ -n "$want" ] || return 1
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    v="$(mr_image_version_of "$name")" || continue
-    [ "$v" = "$want" ] && return 0
+    [ "$name" = "$want" ] && return 0
   done
   return 1
 }
@@ -421,8 +430,19 @@ mr_image_prune_list() {
 
 # `tart list --format json` on stdin. Parsing JSON rather than the columnar
 # output keeps these immune to a change in tart's table formatting.
+#
+# The field names come from tart's VMInfo struct, which encodes its Swift
+# property names verbatim: Source, Name, Disk, Size, Accessed, Running, State.
+# Two values are worth writing down because guessing them wrong fails silently
+# — jq just yields nothing, which reads exactly like "no VMs":
+#   * Source is "local" or "OCI" — capital OCI.
+#   * State is the State enum's raw value: "running" | "suspended" | "stopped".
+#
+# Running (a Bool from vmDir.running()) is checked first because it is
+# unambiguous; State is the fallback so this keeps working on a tart that
+# predates the boolean.
 mr_running_ci_vm_names() {
-  jq -r '.[] | select(.State == "running") | select(.Name | startswith("ci-")) | .Name'
+  jq -r '.[] | select((.Running == true) or (.State == "running")) | select(.Name | startswith("ci-")) | .Name'
 }
 
 # Every entry tart knows about, local VMs and OCI-cache images alike.

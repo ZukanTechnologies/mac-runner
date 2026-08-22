@@ -191,23 +191,35 @@ names() {
   [ "$status" -ne 0 ]
 }
 
-@test "present: the pinned version is found in the OCI shape" {
-  # This is how the pin actually appears after `tart pull`: in the OCI cache
-  # under its registry reference, NOT as a bare local VM name.
+@test "present: the pinned reference is found once it has been pulled" {
+  # This is how the pin appears after `tart pull`: in the OCI cache under its
+  # registry reference.
   names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
-  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
+  run mr_image_ref_present ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1 < "$TEST_TMP/names"
   [ "$status" -eq 0 ]
 }
 
-@test "present: the pinned version is found in the bare local shape" {
+@test "present: a bare local VM of the same version does NOT satisfy the check" {
+  # The migration case, and the one that matters. A build host (or a host
+  # provisioned before the pull/clone distinction was understood) has
+  # zukan-mobile-runner-2026.08.1 locally and nothing in the OCI cache. Every
+  # plist says clone the registry reference, so if this returned true the
+  # installer would skip the GHCR login and pull, and the first agent cycle
+  # would try to fetch the image itself with no credentials established.
   names zukan-mobile-runner-2026.08.1
-  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
-  [ "$status" -eq 0 ]
+  run mr_image_ref_present ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -ne 0 ]
 }
 
 @test "present: a different version is not the pin" {
   names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4
-  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
+  run mr_image_ref_present ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -ne 0 ]
+}
+
+@test "present: an empty host has nothing" {
+  : > "$TEST_TMP/names"
+  run mr_image_ref_present ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1 < "$TEST_TMP/names"
   [ "$status" -ne 0 ]
 }
 
@@ -294,7 +306,7 @@ json_fixture() {
   # Source == "local" cannot see it — which is why presence and prune read
   # mr_image_names — there is deliberately no local-only variant.
   json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","State":"running"},
-                 {"Source":"oci","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
+                 {"Source":"OCI","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
   run mr_image_names < "$TEST_TMP/tart.json"
   [ "${#lines[@]}" -eq 2 ]
 }
@@ -398,4 +410,38 @@ json_fixture() {
   run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
   [ "${#lines[@]}" -eq 1 ]
   [ "${lines[0]}" = "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4" ]
+}
+
+# --- tart's JSON field contract ---------------------------------------------
+
+@test "tart: a running VM is detected via the Running boolean" {
+  # tart's VMInfo carries both `Running` (Bool) and `State` (enum raw value).
+  # Running is checked first because it cannot be misread; State is the
+  # fallback for a tart that predates it.
+  json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","Running":true,"State":"running"}]'
+  run mr_running_ci_vm_names < "$TEST_TMP/tart.json"
+  [ "${lines[0]}" = "ci-mini-1-1712" ]
+}
+
+@test "tart: a running VM is still detected when only State says so" {
+  json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","State":"running"}]'
+  run mr_running_ci_vm_names < "$TEST_TMP/tart.json"
+  [ "${lines[0]}" = "ci-mini-1-1712" ]
+}
+
+@test "tart: a suspended VM is not in flight" {
+  # State's raw values are running | suspended | stopped. A suspended clone is
+  # not executing a job.
+  json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","Running":false,"State":"suspended"}]'
+  run mr_running_ci_vm_names < "$TEST_TMP/tart.json"
+  [ "$output" = "" ]
+}
+
+@test "tart: Source is capital OCI for cache entries, and nothing keys on it" {
+  # Guessing "oci" would have failed silently — jq yields nothing, which reads
+  # exactly like "no images on this host". Nothing filters on Source any more,
+  # and this fixture is spelled the way tart spells it.
+  json_fixture '[{"Source":"OCI","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
+  run mr_image_names < "$TEST_TMP/tart.json"
+  [ "${lines[0]}" = "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1" ]
 }

@@ -294,7 +294,7 @@ EOF
   # Tart prunes its own OCI cache LRU and documents no manual eviction, so a
   # cache entry we could not delete is disk Tart reclaims later — not a broken
   # host. A leftover SLOT is a different matter (next test).
-  mr_stub tart 'echo "[{\"Source\":\"oci\",\"Name\":\"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4\",\"State\":\"stopped\"}]"'
+  mr_stub tart 'echo "[{\"Source\":\"OCI\",\"Name\":\"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4\",\"State\":\"stopped\"}]"'
   run mr_verify_no_leftovers 0 2026.08.1
   [ "$status" -eq 0 ]
   [[ "$output" == *"2026.07.4"* ]]
@@ -304,7 +304,7 @@ EOF
 @test "verify: a fully converged host reports no leftovers" {
   export STUB_LAUNCHCTL_PRINT_RC=1
   mr_converge_slots 2 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
-  mr_stub tart 'echo "[{\"Source\":\"oci\",\"Name\":\"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1\",\"State\":\"stopped\"}]"'
+  mr_stub tart 'echo "[{\"Source\":\"OCI\",\"Name\":\"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1\",\"State\":\"stopped\"}]"'
   run mr_verify_no_leftovers 2 2026.08.1
   [ "$status" -eq 0 ]
 }
@@ -317,4 +317,76 @@ EOF
   run cat "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist"
   [[ "$output" == *"<string>ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1</string>"* ]]
   [[ "$output" != *"<string>zukan-mobile-runner-2026.08.1</string>"* ]]
+}
+
+# --- token file handling (FR-009) -------------------------------------------
+
+@test "token: written owner-only, atomically, with no temp file left behind" {
+  export MR_TOKEN_FILE="$TEST_TMP/config/op-token"
+  run mr_write_token "sa-token-value"
+  [ "$status" -eq 0 ]
+  [ "$(ls -l "$MR_TOKEN_FILE" | cut -c1-10)" = "-rw-------" ]
+  [ "$(cat "$MR_TOKEN_FILE")" = "sa-token-value" ]
+  run bash -c "ls '$TEST_TMP/config'/*.new.* 2>/dev/null"
+  [ "$status" -ne 0 ]
+}
+
+@test "token: replacing an existing loose-permission file ends owner-only" {
+  export MR_TOKEN_FILE="$TEST_TMP/config/op-token"
+  mkdir -p "$TEST_TMP/config"
+  printf 'old\n' > "$MR_TOKEN_FILE"
+  chmod 644 "$MR_TOKEN_FILE"
+  mr_write_token "new-token"
+  [ "$(ls -l "$MR_TOKEN_FILE" | cut -c1-10)" = "-rw-------" ]
+  [ "$(cat "$MR_TOKEN_FILE")" = "new-token" ]
+}
+
+@test "token: an unwritable directory fails instead of reporting success" {
+  export MR_TOKEN_FILE="/proc/nonexistent-dir/op-token"
+  run mr_write_token "sa-token-value"
+  [ "$status" -ne 0 ]
+}
+
+# --- org runner lookup paginates (stale JIT entries accumulate) -------------
+
+@test "runners: a host runner on page 1 is found" {
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\"}]}"'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -eq 0 ]
+}
+
+@test "runners: a host runner on page 2 is found — the listing is paginated" {
+  # Single-job JIT registrations are ephemeral and a VM killed mid-job leaves
+  # an offline entry, so the org listing accumulates stale runners. Checking
+  # only the first 100 would call a healthy host failed (exit 40).
+  # Match on "&page=N": the URL also contains "per_page=100", so a bare
+  # "page=1" glob matches EVERY page (per_page=100 contains page=100 contains
+  # page=1) and the stub would answer page 1 forever.
+  mr_stub curl '
+    case "$*" in
+      *"&page=1"*)
+        printf "{\"runners\":["
+        i=0; while [ $i -lt 100 ]; do
+          [ $i -gt 0 ] && printf ","
+          printf "{\"name\":\"mobile-runner-otherhost-1-%d\"}" "$i"
+          i=$((i+1))
+        done
+        printf "]}" ;;
+      *"&page=2"*)
+        printf "{\"runners\":[{\"name\":\"mobile-runner-mymac-1-1712\"}]}" ;;
+    esac'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -eq 0 ]
+}
+
+@test "runners: a short page ends the search instead of paging forever" {
+  mr_stub curl 'printf "{\"runners\":[{\"name\":\"mobile-runner-otherhost-1-1\"}]}"'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -ne 0 ]
+}
+
+@test "runners: an API failure is not mistaken for 'registered'" {
+  mr_stub curl 'exit 22'
+  run mr_host_runner_registered fake-pat mymac
+  [ "$status" -ne 0 ]
 }
