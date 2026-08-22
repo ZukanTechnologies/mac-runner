@@ -19,15 +19,15 @@ jobs:
           echo "checking: ${files[*]}"
           shellcheck "${files[@]}"
 
-  bats:
+  bats-matrix:
     name: bats (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Linux is fast and is what gates most PRs; macOS is where this code
-        # actually runs, and it is the only place BSD `df`/`wc`/`sort`/`ls`
-        # behavior — which several helpers parse — is exercised for real.
+        # Linux is fast and gates most PRs; macOS is where this code actually
+        # runs, and the only place the BSD df/wc/sort/ls behavior several
+        # helpers parse is exercised for real.
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +42,21 @@ jobs:
 
       - name: run test suite
         run: bats tests/
+
+  # `main` requires a status check named exactly "bats". A matrix job cannot
+  # provide it — each leg reports as "bats (ubuntu-latest)" etc., so the
+  # required context never arrives and every PR sits BLOCKED with all checks
+  # green. This aggregates the matrix under the required name.
+  bats:
+    name: bats
+    runs-on: ubuntu-latest
+    needs: bats-matrix
+    if: always()
+    steps:
+      - name: every bats leg passed
+        run: |
+          echo "bats-matrix result: ${{ needs.bats-matrix.result }}"
+          [ "${{ needs.bats-matrix.result }}" = "success" ]
 
   pin:
     name: image pin is a single valid version
