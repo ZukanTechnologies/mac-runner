@@ -140,9 +140,20 @@ mr_converge_toolchain() {
     return "$MR_EXIT_CONVERGE"
   fi
 
-  # tart lives in an untrusted third-party tap (Homebrew 4.x gate) and sshpass
-  # has never been in core.
-  brew trust cirruslabs/cli >/dev/null 2>&1 || true
+  # Both formulae come from third-party taps that Homebrew will not load until
+  # they are trusted ("Trust non-official tap formulae, casks or commands so
+  # Homebrew may load them"). The old runbook trusted only cirruslabs/cli and
+  # left hudochenkov/sshpass to whatever the operator had done interactively —
+  # which is not a thing a one-command install can rely on.
+  #
+  # `|| true` throughout: on a Homebrew where trust is not required, or is
+  # spelled differently, this is a no-op and the install proceeds. A failure to
+  # trust surfaces as the brew install failing right below, with its own
+  # message, rather than as an opaque exit here.
+  local tap
+  for tap in cirruslabs/cli hudochenkov/sshpass; do
+    brew trust --tap "$tap" >/dev/null 2>&1 || true
+  done
 
   for formula in jq 1password-cli cirruslabs/cli/tart hudochenkov/sshpass/sshpass; do
     if mr_brew_has "${formula##*/}"; then
