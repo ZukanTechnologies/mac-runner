@@ -89,6 +89,24 @@ teardown() {
   [ "$output" = "zukan-mobile-runner-2026.08.1" ]
 }
 
+@test "base image REF is the registry reference, not the bare local name" {
+  # This is the value that lands in every plist's BASE_IMAGE. `tart pull` puts
+  # a remote image in the OCI cache, not into a locally-runnable VM under a
+  # bare name, so an agent told to clone the bare name fails on any host that
+  # did not itself build the image.
+  run mr_base_image_ref 2026.08.1
+  [ "$status" -eq 0 ]
+  [ "$output" = "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1" ]
+}
+
+@test "render: the base image ref survives rendering into the plist" {
+  # It contains / and : — neither is XML-unsafe, but both would be a problem
+  # if the renderer's sed delimiter or escaping ever changed.
+  run mr_render_plist "$TMPL" 1 "$(mr_base_image_ref 2026.08.1)" "" /tmp/slot1.log
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1"* ]]
+}
+
 # --- slot bounds ------------------------------------------------------------
 
 @test "slots: 1 and 2 are accepted" {

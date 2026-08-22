@@ -32,7 +32,6 @@ MR_PIN_FILE="${MR_ROOT}/IMAGE_VERSION"
 MR_LAUNCH_AGENTS="${MR_LAUNCH_AGENTS:-${HOME}/Library/LaunchAgents}"
 MR_TOKEN_FILE="${ZUKAN_OP_TOKEN_FILE:-${HOME}/.config/zukan-runner/op-token}"
 MR_VAULT="${MR_VAULT:-mac-runner}"
-MR_REGISTRY="${MR_REGISTRY:-ghcr.io/zukantechnologies}"
 MR_GH_ORG="${GH_ORG:-ZukanTechnologies}"
 MR_DISK_FLOOR_GB="${MR_DISK_FLOOR_GB:-120}"
 # How long to wait for a slot agent to register a runner before calling the
@@ -165,14 +164,14 @@ mr_converge_toolchain() {
 mr_tart_json() { tart list --format json 2>/dev/null; }
 
 mr_converge_image() {
-  local version image listing have_size need free
+  local version ref listing have_size need free
   version="$1"
-  image="$(mr_base_image_name "$version")"
+  ref="$(mr_base_image_ref "$version")"
   listing="$(mr_tart_json)"
 
-  if printf '%s' "$listing" | mr_local_image_names 2>/dev/null | grep -qx "$image"; then
-    mr_log "image: ${image} already present"
-    mr_summary_add unchanged "image ${image}"
+  if printf '%s' "$listing" | mr_image_names 2>/dev/null | mr_image_present "$version"; then
+    mr_log "image: ${version} already present"
+    mr_summary_add unchanged "image ${ref}"
     return 0
   fi
 
@@ -180,7 +179,9 @@ mr_converge_image() {
   # download starts. The best available estimate of how big the incoming image
   # is, is how big the one already on this host is.
   local existing
-  existing="$(printf '%s' "$listing" | mr_local_image_names | grep "^${MR_IMAGE_PREFIX}-" | head -1)"
+  existing="$(printf '%s' "$listing" | mr_image_names | while IFS= read -r n; do
+    mr_image_version_of "$n" >/dev/null 2>&1 && printf '%s\n' "$n"
+  done | head -1)"
   have_size=""
   if [ -n "$existing" ]; then
     have_size="$(printf '%s' "$listing" | mr_local_image_size_gb "$existing")" || have_size=""
@@ -188,7 +189,7 @@ mr_converge_image() {
   need="$(mr_disk_requirement_gb "$have_size" "$MR_DISK_FLOOR_GB")" || need="$MR_DISK_FLOOR_GB"
   free="$(mr_free_disk_gb /)" || free=""
   if [ -n "$free" ] && [ "$free" -lt "$need" ]; then
-    mr_err "not enough free disk to pull ${image}: need ~${need} GB, have ${free} GB. The previous image is only removed after the new one is running, so both must fit. Free some space, then re-run this command."
+    mr_err "not enough free disk to pull ${ref}: need ~${need} GB, have ${free} GB. The previous image is only removed after the new one is running, so both must fit. Free some space, then re-run this command."
     return "$MR_EXIT_REMEDIABLE"
   fi
 
@@ -203,18 +204,18 @@ mr_converge_image() {
   fi
   unset ghcr_pat
 
-  mr_log "image: pulling ${MR_REGISTRY}/${MR_IMAGE_PREFIX}:${version} (tens of GB — this is the slow part)"
-  if ! tart pull "${MR_REGISTRY}/${MR_IMAGE_PREFIX}:${version}"; then
-    mr_err "could not pull ${MR_REGISTRY}/${MR_IMAGE_PREFIX}:${version}. Check the version exists in the registry (IMAGE_VERSION pin) and that ghcr-pull-pat can read it. Re-run this command to resume."
+  mr_log "image: pulling ${ref} (tens of GB — this is the slow part)"
+  if ! tart pull "$ref"; then
+    mr_err "could not pull ${ref}. Check that version exists in the registry (the IMAGE_VERSION pin) and that ghcr-pull-pat can read it. Re-run this command to resume."
     return "$MR_EXIT_REGISTRY"
   fi
-  mr_summary_add installed "image ${image}"
+  mr_summary_add installed "image ${ref}"
   return 0
 }
 
 # Runs only after the slots are back up on the new image (see file header).
 mr_prune_images() {
-  local keep="$1" name pruned=0
+  local keep_version="$1" name pruned=0
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     mr_log "image: removing superseded ${name}"
@@ -222,10 +223,12 @@ mr_prune_images() {
       mr_summary_add removed "image ${name}"
       pruned=$((pruned + 1))
     else
-      mr_warn "could not remove ${name}; it is only wasting disk. Re-running this command retries."
+      # Not fatal: Tart evicts least-recently-used OCI-cache entries by itself
+      # when it needs the room, so the worst case is disk it reclaims later.
+      mr_warn "could not remove ${name}; Tart will reclaim it from its cache when it needs the space."
     fi
   done <<EOF
-$(mr_tart_json | mr_local_image_names | mr_image_prune_list "$keep")
+$(mr_tart_json | mr_image_names | mr_image_prune_list "$keep_version")
 EOF
   [ "$pruned" -eq 0 ] && mr_log "image: nothing superseded to remove"
   return 0
@@ -343,13 +346,80 @@ mr_converge_slots() {
 
 # --- verify (FR-007) --------------------------------------------------------
 
-mr_verify() {
-  local slots="$1" image="$2" slot failures=0 pat waited hosttag
+# Postcondition 2 of the CLI contract: no credential at rest but the 0600
+# token file.
+#
+# The contract words this as "`grep -R ZUKAN_GH_PAT ~/Library/LaunchAgents` is
+# empty", but that literal check cannot pass any more: the plist template
+# carries a "never add ZUKAN_GH_PAT here" warning in its comment header, so a
+# correctly rendered plist contains the string. Checked here the way
+# mr_plist_is_legacy does it — the launchd KEY — plus a scan for anything that
+# looks like an actual GitHub token value, which is the real concern.
+mr_verify_no_credentials_at_rest() {
+  local dir mode ok=0 offenders
+  dir="$(mr_launch_agents_dir)"
 
-  if mr_tart_json | mr_local_image_names | grep -qx "$image"; then
-    mr_log "verify: image ${image} present"
+  offenders="$(mr_legacy_slots "$dir")"
+  if [ -n "$offenders" ]; then
+    mr_err "verify: slot plist(s) still define a credential key under ${dir}: $(echo "$offenders" | tr '\n' ' ')"
+    ok=1
+  fi
+
+  if [ -d "$dir" ] && grep -rlqE "ghp_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9_]{20}" "$dir" 2>/dev/null; then
+    mr_err "verify: something under ${dir} contains a GitHub token value"
+    ok=1
+  fi
+
+  if [ -e "$MR_TOKEN_FILE" ]; then
+    # BSD and GNU `stat` disagree on flags (-f '%Lp' vs -c '%a'), and the
+    # suite runs on both, so read the mode off `ls`. The path is a fixed
+    # constant, not a glob, so SC2012's filename concern does not apply.
+    # shellcheck disable=SC2012
+    mode="$(ls -l "$MR_TOKEN_FILE" 2>/dev/null | cut -c1-10)"
+    case "$mode" in
+      -rw-------) ;;
+      *)
+        mr_err "verify: ${MR_TOKEN_FILE} is ${mode}, expected -rw------- (owner only)"
+        ok=1
+        ;;
+    esac
+  fi
+
+  return "$ok"
+}
+
+# Postcondition 3 of the CLI contract — nothing superseded left behind.
+#
+# A leftover SLOT fails the run: it is entirely ours to remove, and one left
+# loaded keeps taking jobs it should not.
+#
+# A leftover IMAGE only warns. Tart owns its OCI cache and prunes it LRU when
+# it needs the space ("Tart will remove the least recently accessed VMs from
+# OCI cache ... until enough free space is available"), and it documents no
+# manual command for evicting a cached reference — so a cache entry we could
+# not delete costs disk that Tart reclaims on its own. Failing the whole
+# install over that would report a broken host on every upgrade.
+mr_verify_no_leftovers() {
+  local slots="$1" version="$2" ok=0 leftover
+  leftover="$(mr_slots_to_remove "$slots" "$(mr_launch_agents_dir)")"
+  if [ -n "$leftover" ]; then
+    mr_err "verify: slot plist(s) above SLOTS=${slots} still present: $(echo "$leftover" | tr '\n' ' ')"
+    ok=1
+  fi
+  leftover="$(mr_tart_json | mr_image_names | mr_image_prune_list "$version")"
+  if [ -n "$leftover" ]; then
+    mr_warn "superseded image(s) still on disk: $(echo "$leftover" | tr '\n' ' ') — Tart reclaims its OCI cache automatically when it needs the space"
+  fi
+  return "$ok"
+}
+
+mr_verify() {
+  local slots="$1" version="$2" slot failures=0 pat waited hosttag
+
+  if mr_tart_json | mr_image_names | mr_image_present "$version"; then
+    mr_log "verify: image ${version} present"
   else
-    mr_err "verify: image ${image} is not on this host"
+    mr_err "verify: image ${version} is not on this host"
     failures=$((failures + 1))
   fi
 
@@ -361,6 +431,23 @@ mr_verify() {
       failures=$((failures + 1))
     fi
   done
+
+  # Contract postcondition 2 — no credential at rest but the token file. This
+  # is the security promise the whole epic exists for, so it is asserted on the
+  # host after the run rather than inferred from the converge having succeeded.
+  if mr_verify_no_credentials_at_rest; then
+    mr_log "verify: no credential at rest beyond the 0600 token file"
+  else
+    failures=$((failures + 1))
+  fi
+
+  # Contract postcondition 3 — nothing left over: no slot above SLOTS, no
+  # legacy plist, no superseded image.
+  if mr_verify_no_leftovers "$slots" "$version"; then
+    mr_log "verify: no superseded slots or images left behind"
+  else
+    failures=$((failures + 1))
+  fi
 
   # Registration: agents JIT-register at the START of a cycle, so a healthy
   # host shows a runner within about one VM boot.
@@ -399,14 +486,16 @@ main() {
   # leaking into the caller turns any unset variable there into a hard failure.
   set -uo pipefail
 
-  local slots version image rc
+  local slots version ref rc
 
   slots="$(mr_resolve_slots)" || exit "$MR_EXIT_REMEDIABLE"
   version="$(mr_resolve_image_version "$MR_PIN_FILE")" || exit "$MR_EXIT_REMEDIABLE"
-  image="$(mr_base_image_name "$version")"
+  # What every slot plist clones from; see mr_base_image_ref for why this is
+  # the registry reference and not the bare local name.
+  ref="$(mr_base_image_ref "$version")"
 
   mr_summary_reset
-  mr_log "converging this host: ${slots} slot(s), image ${image}"
+  mr_log "converging this host: ${slots} slot(s), image ${ref}"
 
   # Re-run the full read-only gate here too: install.sh checked it before
   # Homebrew, but a run started from a local checkout skips that path.
@@ -417,11 +506,11 @@ main() {
   mr_converge_image "$version" || exit $?
   mr_converge_agent_script || exit $?
   mr_wait_for_idle || exit $?
-  mr_converge_slots "$slots" "$image" || exit $?
-  mr_prune_images "$image"
+  mr_converge_slots "$slots" "$ref" || exit $?
+  mr_prune_images "$version"
 
   rc=0
-  mr_verify "$slots" "$image" || rc=$?
+  mr_verify "$slots" "$version" || rc=$?
 
   mr_summary_print
   printf '\n'

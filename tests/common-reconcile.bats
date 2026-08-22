@@ -158,45 +158,108 @@ seed_slot() {
 # The helpers below read tart's output on stdin rather than shelling out, so
 # the decision is testable without a tart stub and cannot be confused by a
 # future change to tart's CLI surface.
+#
+# An image appears in two shapes: the OCI-cache entry the installer pulls
+# (ghcr.io/…/zukan-mobile-runner:VER) and the bare local VM packer leaves on a
+# build host (zukan-mobile-runner-VER). The prune keys on the VERSION so it
+# recognizes both.
 
 # Write $@ as one name per line into a fixture the test redirects into stdin.
 names() {
   printf '%s\n' "$@" > "$TEST_TMP/names"
 }
 
-@test "prune: superseded runner images are pruned, the pin is kept" {
-  names zukan-mobile-runner-2026.07.4 zukan-mobile-runner-2026.08.1
-  run mr_image_prune_list zukan-mobile-runner-2026.08.1 < "$TEST_TMP/names"
+@test "version-of: the OCI reference shape is recognized" {
+  run mr_image_version_of "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1"
   [ "$status" -eq 0 ]
+  [ "$output" = "2026.08.1" ]
+}
+
+@test "version-of: the bare local-VM shape is recognized" {
+  run mr_image_version_of "zukan-mobile-runner-2026.08.1"
+  [ "$status" -eq 0 ]
+  [ "$output" = "2026.08.1" ]
+}
+
+@test "version-of: an ephemeral ci-* clone is not one of ours" {
+  run mr_image_version_of "ci-macmini-1-1712345678"
+  [ "$status" -ne 0 ]
+}
+
+@test "version-of: someone else's image is not one of ours" {
+  run mr_image_version_of "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+  [ "$status" -ne 0 ]
+}
+
+@test "present: the pinned version is found in the OCI shape" {
+  # This is how the pin actually appears after `tart pull`: in the OCI cache
+  # under its registry reference, NOT as a bare local VM name.
+  names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -eq 0 ]
+}
+
+@test "present: the pinned version is found in the bare local shape" {
+  names zukan-mobile-runner-2026.08.1
+  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -eq 0 ]
+}
+
+@test "present: a different version is not the pin" {
+  names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4
+  run mr_image_present 2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -ne 0 ]
+}
+
+@test "prune: a superseded OCI entry is pruned, the pinned one kept" {
+  names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4 \
+        ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -eq 0 ]
+  [ "${#lines[@]}" -eq 1 ]
+  [ "${lines[0]}" = "ghcr.io/zukantechnologies/zukan-mobile-runner:2026.07.4" ]
+}
+
+@test "prune: a superseded bare local VM is pruned too" {
+  names zukan-mobile-runner-2026.07.4 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
   [ "${#lines[@]}" -eq 1 ]
   [ "${lines[0]}" = "zukan-mobile-runner-2026.07.4" ]
 }
 
+@test "prune: both shapes of the PINNED version survive" {
+  # A build host has the local VM packer made and the OCI entry it pushed.
+  # Neither is superseded.
+  names zukan-mobile-runner-2026.08.1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
+  [ "$status" -eq 0 ]
+  [ "$output" = "" ]
+}
+
 @test "prune: unrelated images on the host are never touched" {
   names ghcr.io/cirruslabs/macos-sequoia-base my-own-vm zukan-mobile-runner-2026.07.4
-  run mr_image_prune_list zukan-mobile-runner-2026.08.1 < "$TEST_TMP/names"
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
   [ "${#lines[@]}" -eq 1 ]
   [ "${lines[0]}" = "zukan-mobile-runner-2026.07.4" ]
 }
 
 @test "prune: ephemeral ci-* clones are never pruned — they belong to the agent" {
-  names ci-macmini-1-1712345678 zukan-mobile-runner-2026.08.1
-  run mr_image_prune_list zukan-mobile-runner-2026.08.1 < "$TEST_TMP/names"
+  names ci-macmini-1-1712345678 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
   [ "$output" = "" ]
 }
 
 @test "prune: nothing to prune yields empty output and success" {
-  names zukan-mobile-runner-2026.08.1
-  run mr_image_prune_list zukan-mobile-runner-2026.08.1 < "$TEST_TMP/names"
+  names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run mr_image_prune_list 2026.08.1 < "$TEST_TMP/names"
   [ "$status" -eq 0 ]
   [ "$output" = "" ]
 }
 
-@test "prune: refuses to run without a keep argument rather than pruning everything" {
-  names zukan-mobile-runner-2026.08.1
+@test "prune: refuses to run without a version to keep rather than pruning everything" {
+  names ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
   run mr_image_prune_list < "$TEST_TMP/names"
   [ "$status" -ne 0 ]
-  [ "$output" != "zukan-mobile-runner-2026.08.1" ]
 }
 
 # --- tart list parsing ------------------------------------------------------
@@ -232,6 +295,16 @@ json_fixture() {
   run mr_local_image_names < "$TEST_TMP/tart.json"
   [ "${#lines[@]}" -eq 1 ]
   [ "${lines[0]}" = "zukan-mobile-runner-2026.08.1" ]
+}
+
+@test "tart: every entry is listed regardless of source" {
+  # The pinned image lives in the OCI cache, so anything that filters on
+  # Source == "local" cannot see it — which is why presence and prune read
+  # mr_image_names, not mr_local_image_names.
+  json_fixture '[{"Source":"local","Name":"ci-mini-1-1712","State":"running"},
+                 {"Source":"oci","Name":"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1","State":"stopped"}]'
+  run mr_image_names < "$TEST_TMP/tart.json"
+  [ "${#lines[@]}" -eq 2 ]
 }
 
 @test "tart: an empty listing parses to nothing" {

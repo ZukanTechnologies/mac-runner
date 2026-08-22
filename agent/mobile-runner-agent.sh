@@ -21,7 +21,13 @@
 #   override only — never set it in a plist.
 #
 # Host env (set in the plist by the installer):
-#   BASE_IMAGE       e.g. zukan-mobile-runner-2026.07.2 (local tart image)
+#   BASE_IMAGE       what to clone, e.g.
+#                    ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+#                    Use the REGISTRY REFERENCE, not a bare local name: `tart
+#                    pull` populates the OCI cache (~/.tart/cache/OCIs/), not a
+#                    locally-runnable VM, so the bare name only resolves on the
+#                    Mac that built the image with packer. `tart clone <ref>`
+#                    reads the cache directly.
 #   SLOT             1..N — unique per agent instance on this host.
 #   GH_ORG           org to register the runner under (default ZukanTechnologies).
 #   RUNNER_GROUP_ID  org runner group id (default 1 = "Default"; the group must

@@ -22,6 +22,7 @@ MR_MIN_MACOS="${MR_MIN_MACOS:-15}"
 MR_MAX_SLOTS="${MR_MAX_SLOTS:-2}"
 MR_DEFAULT_SLOTS="${MR_DEFAULT_SLOTS:-2}"
 MR_IMAGE_PREFIX="zukan-mobile-runner"
+MR_REGISTRY="${MR_REGISTRY:-ghcr.io/zukantechnologies}"
 MR_LABEL_PREFIX="com.zukan.mobile-runner-agent"
 # Slack on top of "room for a second copy of the image", for the runner's own
 # work dirs and the OS.
@@ -209,8 +210,47 @@ mr_resolve_image_version() {
   mr_read_pin "$pin_file"
 }
 
+# The name a host's agent clones from, and the value the installer renders into
+# every plist's BASE_IMAGE.
+#
+# This is the fully-qualified OCI reference, NOT the bare local name. `tart
+# pull` puts a remote image in the OCI cache (~/.tart/cache/OCIs/); it does not
+# create a locally-runnable VM under a bare name. `tart clone <ref> <vm>` reads
+# straight from that cache. The bare name exists only on the Mac that ran
+# packer, which is why zukan's build.sh epilogue says to point BASE_IMAGE at
+# "${IMAGE} (or the GHCR ref)" — every host but the build host needs the ref.
+mr_base_image_ref() {
+  printf '%s/%s:%s\n' "$MR_REGISTRY" "$MR_IMAGE_PREFIX" "$1"
+}
+
+# The bare local-VM name. Still meaningful on a build host, where packer leaves
+# one behind, and on hosts provisioned before the pull/clone distinction was
+# understood — so the prune path has to recognize it.
 mr_base_image_name() {
   printf '%s-%s\n' "$MR_IMAGE_PREFIX" "$1"
+}
+
+# The version an image name refers to, in either shape; non-zero when the name
+# is not one of ours (an ephemeral `ci-*` clone, or somebody else's VM).
+mr_image_version_of() {
+  local name="$1"
+  case "$name" in
+    "${MR_IMAGE_PREFIX}"-*)  printf '%s\n' "${name#"${MR_IMAGE_PREFIX}"-}" ;;
+    *"${MR_IMAGE_PREFIX}":*) printf '%s\n' "${name##*:}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Is the pinned version on this host, in either shape? Reads names on stdin.
+mr_image_present() {
+  local want="$1" name v
+  [ -n "$want" ] || return 1
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    v="$(mr_image_version_of "$name")" || continue
+    [ "$v" = "$want" ] && return 0
+  done
+  return 1
 }
 
 # --- slots ------------------------------------------------------------------
@@ -343,22 +383,22 @@ mr_slots_to_remove() {
   return 0
 }
 
-# Reads local image names on stdin, prints the ones to delete. Only our own
-# prefixed images are ever candidates: a `ci-*` clone belongs to a running
+# Reads image names on stdin, prints the ones to delete. Keyed on the VERSION
+# to keep, so it recognizes both shapes — the OCI cache entry the installer
+# pulls and the bare local VM packer leaves on a build host.
+#
+# Only our own images are ever candidates: a `ci-*` clone belongs to a running
 # agent cycle, and anything else on the host belongs to its owner.
 mr_image_prune_list() {
-  local keep="$1" name
+  local keep="$1" name v
   if [ -z "$keep" ]; then
-    mr_err "mr_image_prune_list: refusing to build a prune list without the image to keep"
+    mr_err "mr_image_prune_list: refusing to build a prune list without the version to keep"
     return 1
   fi
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    case "$name" in
-      "${MR_IMAGE_PREFIX}"-*) ;;
-      *) continue ;;
-    esac
-    [ "$name" = "$keep" ] && continue
+    v="$(mr_image_version_of "$name")" || continue
+    [ "$v" = "$keep" ] && continue
     printf '%s\n' "$name"
   done
   return 0
@@ -374,12 +414,19 @@ mr_local_image_names() {
   jq -r '.[] | select(.Source == "local") | .Name'
 }
 
+# Every entry tart knows about, local VMs and OCI-cache images alike. This is
+# what the presence and prune checks read: the pinned image lives in the OCI
+# cache, so a Source == "local" filter would never see it.
+mr_image_names() {
+  jq -r '.[] | .Name'
+}
+
 # Size in GB of one local image, from the same JSON. Empty when tart does not
 # know the image (nothing pulled yet).
 mr_local_image_size_gb() {
   local name="$1" out
   [ -n "$name" ] || return 1
-  out="$(jq -r --arg n "$name" '.[] | select(.Source == "local") | select(.Name == $n) | .Size' 2>/dev/null)"
+  out="$(jq -r --arg n "$name" '.[] | select(.Name == $n) | .Size' 2>/dev/null)"
   case "$out" in
     ''|null|*[!0-9]*) return 1 ;;
   esac

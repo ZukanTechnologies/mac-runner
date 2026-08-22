@@ -164,6 +164,11 @@ cp agent/mobile-runner-agent.sh /opt/zukan/ && chmod +x /opt/zukan/mobile-runner
 # One plist per slot (1..2): copy agent/com.zukan.mobile-runner-agent.plist.tmpl to
 # ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot<N>.plist and replace
 # {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}}, then:
+#
+# {{BASE_IMAGE}} is the full registry reference
+# (ghcr.io/zukantechnologies/zukan-mobile-runner:<version>), NOT a bare local
+# name — `tart pull` fills the OCI cache, not a runnable local VM, so a bare
+# name only resolves on the Mac that built the image.
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
 ```
 
