@@ -19,12 +19,23 @@ setup() {
   [ -x "$REPO/install.sh" ]
 }
 
-@test "install.sh is parseable by bash 3.2 — the shell that runs the one-liner" {
-  # /bin/bash on macOS is still 3.2 and the entrypoint runs before Homebrew
-  # exists, so a bash-4 construct here breaks every fresh install.
+@test "every shell file is parseable by bash 3.2" {
+  # /bin/bash on macOS is still 3.2 and there is no point at which this code is
+  # guaranteed a newer one: the entrypoint runs before Homebrew exists, it
+  # `exec bash lib/install-main.sh` (still /bin/bash unless someone has put a
+  # brewed bash first on PATH), and the agent's launchd plist puts
+  # /opt/homebrew/bin ahead of /bin but installs no bash there. A bash-4
+  # construct in any of these breaks a fresh install with a syntax error.
   [ -x /bin/bash ] || skip "no /bin/bash"
-  run /bin/bash -n "$REPO/install.sh"
-  [ "$status" -eq 0 ]
+  local f
+  for f in "$REPO"/install.sh "$REPO"/lib/*.sh "$REPO"/agent/*.sh; do
+    run /bin/bash -n "$f"
+    [ "$status" -eq 0 ] || {
+      echo "not bash-3.2 parseable: $f"
+      echo "$output"
+      return 1
+    }
+  done
 }
 
 @test "every shell file parses" {
