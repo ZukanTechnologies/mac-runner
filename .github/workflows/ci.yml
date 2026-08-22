@@ -20,12 +20,40 @@ jobs:
           shellcheck "${files[@]}"
 
   bats:
-    name: bats
-    runs-on: ubuntu-latest
+    name: bats (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux is fast and is what gates most PRs; macOS is where this code
+        # actually runs, and it is the only place BSD `df`/`wc`/`sort`/`ls`
+        # behavior — which several helpers parse — is exercised for real.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: install bats-core
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+
+      - name: install bats-core + jq (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats jq
+
+      - name: install bats-core + jq (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core jq
+
       - name: run test suite
         run: bats tests/
 
+  pin:
+    name: image pin is a single valid version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate IMAGE_VERSION
+        shell: bash
+        run: |
+          # The pin is a production input: every install on every host pulls
+          # whatever this file says. A malformed value here breaks the fleet,
+          # not just the build.
+          . lib/common.sh
+          version="$(mr_read_pin IMAGE_VERSION)"
+          echo "pinned image version: ${version}"
