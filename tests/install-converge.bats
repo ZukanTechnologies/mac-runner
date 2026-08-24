@@ -604,12 +604,33 @@ EOF
   [ "$(grep -c "bootstrap" "$STUB_STATE_DIR/launchctl.log")" -ge 2 ]
 }
 
-@test "rollback: a fresh slot that fails to bootstrap leaves no half-written plist" {
+@test "rollback: a fresh slot that fails to bootstrap KEEPS its plist" {
+  # There is nothing to roll back to, so the question is what leaves the host
+  # better off. The plist rendered fine — bootstrap here usually fails on the
+  # environment (no GUI session), not the file — so leaving it means RunAtLoad
+  # picks it up at the next login and a GUI-session re-run loads it at once.
+  # Deleting it would guarantee that nothing ever loads.
   export STUB_LAUNCHCTL_PRINT_RC=1
   export STUB_LAUNCHCTL_BOOTSTRAP_FAIL=all
   run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
   [ "$status" -eq 30 ]
-  [ ! -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist" ]
+  [ -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist" ]
+  [[ "$output" == *"will load at the next login"* ]]
+}
+
+@test "rollback: a failed restore says where the previous definition is" {
+  # Without checking the mv, the next step would bootstrap the NEW plist —
+  # the one that just failed — and call it a rollback.
+  seed_legacy_slot 1
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  export STUB_LAUNCHCTL_BOOTSTRAP_FAIL=all
+  mr_stub mv 'exit 1'
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+  [[ "$output" == *"mr-backup"* ]]
+  [[ "$output" == *"by hand"* ]]
+  # Exactly one bootstrap attempt: the failed one. No pretend rollback.
+  [ "$(grep -c bootstrap "$STUB_STATE_DIR/launchctl.log")" -eq 1 ]
 }
 
 @test "rollback: no backup file is left behind on success" {

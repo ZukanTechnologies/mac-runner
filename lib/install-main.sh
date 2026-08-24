@@ -437,13 +437,24 @@ mr_install_slot() {
   fi
 
   mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule."
+
   if [ -n "$backup" ]; then
     mr_warn "restoring the previous slot ${slot} definition and reloading it"
-    mv -f "$backup" "$path"
+    if ! mv -f "$backup" "$path"; then
+      # Without this check the next line would "roll back" by bootstrapping
+      # the new plist again — the one that just failed.
+      mr_warn "could not restore ${path} from ${backup}. The previous definition is still at ${backup}; move it back by hand and 'launchctl bootstrap ${MR_GUI_DOMAIN} ${path}'."
+      return "$MR_EXIT_CONVERGE"
+    fi
     launchctl bootstrap "$MR_GUI_DOMAIN" "$path" >/dev/null 2>&1 \
       || mr_warn "could not reload the previous slot ${slot} agent either; this host has no agent on slot ${slot} until a successful run or a reboot"
   else
-    rm -f "$path"
+    # Leave the plist in place. It rendered fine — the usual reason bootstrap
+    # fails here is the environment (no GUI session), not the file — so
+    # RunAtLoad picks it up at the next login, and a re-run from the GUI
+    # session loads it immediately. Deleting it would guarantee that nothing
+    # ever loads instead.
+    mr_warn "the slot ${slot} plist is in place at ${path} but not loaded; it will load at the next login, or immediately if you re-run this from the GUI session"
   fi
   return "$MR_EXIT_CONVERGE"
 }
