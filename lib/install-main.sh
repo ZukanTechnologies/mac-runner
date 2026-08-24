@@ -395,25 +395,69 @@ mr_render_all_slots() {
   return 0
 }
 
+# Install one staged plist, with rollback.
+#
+# launchd has no atomic swap: replacing a slot's definition means bootout then
+# bootstrap, so there is an unavoidable window. Two things narrow it:
+#
+#   * the new plist is written BEFORE the old agent is unloaded, so a failed
+#     copy costs nothing — the running agent is untouched;
+#   * a failed bootstrap restores the previous definition and reloads it.
+#
+# The rollback matters most for the likeliest failure there is: running the
+# installer over ssh instead of in the GUI session. That fails bootstrap for
+# every slot, and without rollback it would take a working host down.
+#
+# Rolling back a legacy slot restores its plaintext-PAT plist. That is the
+# right trade: the credential was already on disk, and a host with no agent is
+# worse than a host still waiting to be migrated on the next run.
+mr_install_slot() {
+  local slot="$1" staged="$2" path backup
+
+  path="$(mr_plist_path "$slot")"
+  backup=""
+  if [ -f "$path" ]; then
+    backup="${path}.mr-backup.$$"
+    if ! cp "$path" "$backup"; then
+      mr_err "could not back up the current slot ${slot} definition; refusing to replace it."
+      return "$MR_EXIT_CONVERGE"
+    fi
+  fi
+
+  if ! cp "$staged" "$path"; then
+    mr_err "could not write ${path}. The existing slot ${slot} agent is still loaded and untouched."
+    [ -n "$backup" ] && mv -f "$backup" "$path"
+    return "$MR_EXIT_CONVERGE"
+  fi
+
+  mr_bootout_slot "$slot"
+  if launchctl bootstrap "$MR_GUI_DOMAIN" "$path"; then
+    [ -n "$backup" ] && rm -f "$backup"
+    return 0
+  fi
+
+  mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule."
+  if [ -n "$backup" ]; then
+    mr_warn "restoring the previous slot ${slot} definition and reloading it"
+    mv -f "$backup" "$path"
+    launchctl bootstrap "$MR_GUI_DOMAIN" "$path" >/dev/null 2>&1 \
+      || mr_warn "could not reload the previous slot ${slot} agent either; this host has no agent on slot ${slot} until a successful run or a reboot"
+  else
+    rm -f "$path"
+  fi
+  return "$MR_EXIT_CONVERGE"
+}
+
 # Install the staged plists. Only reached once every one of them rendered.
 mr_apply_slot_converge() {
   local slots="$1" image="$2" staging="$3" slot path rendered stale legacy
 
-  # Slots this host should no longer have (US2-AC4). These have no replacement
-  # coming, so removal IS the whole operation — no window to leave open.
-  for stale in $(mr_slots_to_remove "$slots" "$MR_LAUNCH_AGENTS"); do
-    mr_log "slots: removing slot ${stale} (SLOTS=${slots})"
-    mr_bootout_slot "$stale"
-    rm -f "$(mr_plist_path "$stale")"
-    mr_summary_add removed "slot ${stale}"
-  done
+  mkdir -p "$MR_LAUNCH_AGENTS" || return "$MR_EXIT_CONVERGE"
 
   # The legacy hand-provisioned layout is NOT deleted separately. Its plist
-  # sits at the same path as the slot's new one, so the normal
-  # bootout -> write -> bootstrap below replaces it in one step — and a legacy
-  # plist can never match the rendered secretless one, so it always takes that
-  # path. Deleting it up front only opened a window where a later failure left
-  # the host with no agents at all. This loop just records the migration.
+  # sits at the same path as the slot's new one, so mr_install_slot replaces it
+  # in one step — and a legacy plist can never match the rendered secretless
+  # one, so it always takes that path. This loop only records the migration.
   for legacy in $(mr_legacy_slots "$MR_LAUNCH_AGENTS"); do
     if [ "$legacy" -le "$slots" ]; then
       mr_log "slots: slot ${legacy} is the legacy layout with the token embedded in its plist — replacing it"
@@ -421,6 +465,10 @@ mr_apply_slot_converge() {
     fi
   done
 
+  # Bring up the slots we WANT first. Obsolete ones are retired only once
+  # these are running, so a failure here can never leave the host with
+  # everything unloaded — reducing 2 slots to 1 used to delete slot 2 up
+  # front, so a slot 1 that then failed to bootstrap took both down.
   for slot in $(seq 1 "$slots"); do
     path="$(mr_plist_path "$slot")"
     rendered="$(cat "${staging}/slot${slot}.plist")"
@@ -431,15 +479,22 @@ mr_apply_slot_converge() {
       continue
     fi
 
-    mr_bootout_slot "$slot"
-    cp "${staging}/slot${slot}.plist" "$path" || return "$MR_EXIT_CONVERGE"
-    if ! launchctl bootstrap "$MR_GUI_DOMAIN" "$path"; then
-      mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule. The plist is in place, so a re-run from the GUI session loads it."
-      return "$MR_EXIT_CONVERGE"
-    fi
+    mr_install_slot "$slot" "${staging}/slot${slot}.plist" || return "$MR_EXIT_CONVERGE"
     mr_log "slots: slot ${slot} loaded on ${image}"
     mr_summary_add changed "slot ${slot}"
   done
+
+  # Now that the wanted slots are up, retire the rest (US2-AC4).
+  for stale in $(mr_slots_to_remove "$slots" "$MR_LAUNCH_AGENTS"); do
+    mr_log "slots: removing slot ${stale} (SLOTS=${slots})"
+    mr_bootout_slot "$stale"
+    if rm -f "$(mr_plist_path "$stale")"; then
+      mr_summary_add removed "slot ${stale}"
+    else
+      mr_warn "unloaded slot ${stale} but could not delete $(mr_plist_path "$stale") — it will not load again, but remove it by hand"
+    fi
+  done
+
   return 0
 }
 
@@ -450,10 +505,11 @@ mr_apply_slot_converge() {
 # the host with its old agents unloaded and deleted and no new ones — on the
 # live host, mobile CI silently stops — while the error said "Nothing was
 # loaded; re-running this command is safe", which was not true.
+#
+# Nothing here touches the host, not even mkdir: the render phase writes only
+# into a staging directory, so "nothing has been changed" is literally true.
 mr_converge_slots() {
   local slots="$1" image="$2" staging rc
-
-  mkdir -p "$MR_LAUNCH_AGENTS" || return "$MR_EXIT_CONVERGE"
 
   staging="$(mktemp -d)" || {
     mr_err "could not create a staging directory for the slot plists."

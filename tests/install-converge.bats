@@ -19,10 +19,21 @@ setup() {
   # launchctl: records every call so the test can assert what was asked of it.
   # `print` answers "is this slot loaded?" — STUB_LAUNCHCTL_PRINT_RC=1 models a
   # slot that is not loaded (a fresh host).
+  # STUB_LAUNCHCTL_BOOTSTRAP_FAIL: a slot number whose bootstrap fails (or
+  # "all"), for exercising the rollback path.
   mr_stub launchctl '
     printf "%s\n" "$*" >> "$STUB_STATE_DIR/launchctl.log"
     case "$1" in
       print) exit "${STUB_LAUNCHCTL_PRINT_RC:-0}" ;;
+      bootstrap)
+        fail="${STUB_LAUNCHCTL_BOOTSTRAP_FAIL:-}"
+        if [ -n "$fail" ]; then
+          case "$*" in
+            *"slot${fail}.plist"*) exit 1 ;;
+          esac
+          [ "$fail" = "all" ] && exit 1
+        fi
+        exit 0 ;;
     esac
     exit 0'
   mr_stub tart 'echo "[]"'
@@ -572,4 +583,84 @@ EOF
   local after_fail
   after_fail="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'tmp.*' -newer "$TEST_TMP" -type d 2>/dev/null | wc -l | tr -d ' ')"
   [ "$after_fail" -le "$after_ok" ]
+}
+
+# --- apply-phase rollback ---------------------------------------------------
+
+@test "rollback: a failed bootstrap restores and reloads the previous definition" {
+  # The likeliest real failure is running the installer over ssh instead of in
+  # the GUI session: bootstrap fails for every slot. Without rollback that
+  # takes a working host down.
+  seed_legacy_slot 1
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  export STUB_LAUNCHCTL_BOOTSTRAP_FAIL=all
+
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+
+  # The previous definition is back on disk and was re-bootstrapped.
+  grep -q "ZUKAN_GH_PAT" "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist"
+  [[ "$output" == *"restoring the previous slot 1 definition"* ]]
+  [ "$(grep -c "bootstrap" "$STUB_STATE_DIR/launchctl.log")" -ge 2 ]
+}
+
+@test "rollback: a fresh slot that fails to bootstrap leaves no half-written plist" {
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  export STUB_LAUNCHCTL_BOOTSTRAP_FAIL=all
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+  [ ! -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist" ]
+}
+
+@test "rollback: no backup file is left behind on success" {
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  seed_legacy_slot 1
+  mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  run bash -c "ls '${MR_LAUNCH_AGENTS}'/*.mr-backup.* 2>/dev/null"
+  [ "$status" -ne 0 ]
+}
+
+@test "rollback: an unwritable target fails before the old agent is unloaded" {
+  seed_legacy_slot 1
+  chmod 444 "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist"
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  chmod 644 "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist" 2>/dev/null || true
+  [ "$status" -eq 30 ]
+  # The write is attempted before the bootout, so nothing was unloaded.
+  [[ "$(launchctl_log)" != *"bootout"* ]]
+}
+
+# --- ordering: wanted slots come up before obsolete ones are retired --------
+
+@test "order: reducing 2 slots to 1 keeps slot 2 when slot 1 cannot start" {
+  # Slot 2 used to be booted out and deleted first, so a slot 1 that then
+  # failed to bootstrap took the whole host down.
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  mr_converge_slots 2 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  : > "$STUB_STATE_DIR/launchctl.log"
+
+  export STUB_LAUNCHCTL_BOOTSTRAP_FAIL=1
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.2
+  [ "$status" -eq 30 ]
+  [ -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot2.plist" ]
+}
+
+@test "order: a successful reduction still retires slot 2" {
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  mr_converge_slots 2 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  mr_summary_reset
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 0 ]
+  [ ! -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot2.plist" ]
+}
+
+# --- the render phase really touches nothing --------------------------------
+
+@test "atomic: a render failure does not even create the LaunchAgents dir" {
+  export MR_LAUNCH_AGENTS="$TEST_TMP/never-created/LaunchAgents"
+  export RUNNER_EXTRA_LABELS="a&b"
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+  [ ! -d "$MR_LAUNCH_AGENTS" ]
 }
