@@ -517,3 +517,59 @@ EOF
   [ "$status" -eq 30 ]
   [[ "$output" == *"min left before giving up"* ]]
 }
+
+# --- render before mutate: a failure must not strip a working host ---------
+
+@test "atomic: a render failure leaves the legacy plist in place and loaded" {
+  # The regression. Converge used to delete the legacy plists first and render
+  # each replacement as it went, so a render failure partway through left the
+  # host with its old agents unloaded and deleted and no new ones — on the live
+  # host, mobile CI silently stops — while the error claimed nothing had been
+  # changed.
+  seed_legacy_slot 1
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  # An XML-unsafe label is the cheapest way to make rendering fail.
+  export RUNNER_EXTRA_LABELS="a&b"
+
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+
+  # The host is exactly as it was.
+  [ -f "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist" ]
+  grep -q "ZUKAN_GH_PAT" "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist"
+  [[ "$(launchctl_log)" != *"bootout"* ]]
+}
+
+@test "atomic: the render-failure message is true about what happened" {
+  seed_legacy_slot 1
+  export RUNNER_EXTRA_LABELS="a&b"
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [[ "$output" == *"Nothing on this host has been changed"* ]]
+}
+
+@test "atomic: slot 2 failing to render does not disturb slot 1 either" {
+  # Rendering is all-or-nothing across slots, not per slot.
+  seed_legacy_slot 1
+  seed_legacy_slot 2
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  export RUNNER_EXTRA_LABELS="a<b"
+  run mr_converge_slots 2 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+  grep -q "ZUKAN_GH_PAT" "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot1.plist"
+  grep -q "ZUKAN_GH_PAT" "${MR_LAUNCH_AGENTS}/com.zukan.mobile-runner-agent.slot2.plist"
+  [[ "$(launchctl_log)" != *"bootout"* ]]
+}
+
+@test "atomic: no staging directory is left behind on success or failure" {
+  export STUB_LAUNCHCTL_PRINT_RC=1
+  mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  local after_ok
+  after_ok="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'tmp.*' -newer "$TEST_TMP" -type d 2>/dev/null | wc -l | tr -d ' ')"
+
+  export RUNNER_EXTRA_LABELS="a&b"
+  run mr_converge_slots 1 ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1
+  [ "$status" -eq 30 ]
+  local after_fail
+  after_fail="$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'tmp.*' -newer "$TEST_TMP" -type d 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$after_fail" -le "$after_ok" ]
+}

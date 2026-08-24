@@ -379,14 +379,28 @@ mr_converge_agent_script() {
   return 0
 }
 
-mr_converge_slots() {
-  local slots="$1" image="$2" slot path rendered log_path labels stale legacy
-
-  mkdir -p "$MR_LAUNCH_AGENTS" || return "$MR_EXIT_CONVERGE"
+# Render every desired slot into a staging directory. Touches nothing on the
+# host — this is the phase that is allowed to fail.
+mr_render_all_slots() {
+  local slots="$1" image="$2" staging="$3" slot labels log_path
   labels="${RUNNER_EXTRA_LABELS:-}"
+  for slot in $(seq 1 "$slots"); do
+    log_path="$(mr_default_log_path "$slot")"
+    if ! mr_render_plist "$MR_PLIST_TMPL" "$slot" "$image" "$labels" "$log_path" "$MR_GH_ORG" \
+         > "${staging}/slot${slot}.plist"; then
+      mr_err "could not render the launchd plist for slot ${slot}. Nothing on this host has been changed — every slot is rendered before any is touched — so re-running this command is safe."
+      return 1
+    fi
+  done
+  return 0
+}
 
-  # Slots this host should no longer have (US2-AC4), plus anything from the
-  # legacy hand-provisioned layout, whose plist holds the org PAT in plaintext.
+# Install the staged plists. Only reached once every one of them rendered.
+mr_apply_slot_converge() {
+  local slots="$1" image="$2" staging="$3" slot path rendered stale legacy
+
+  # Slots this host should no longer have (US2-AC4). These have no replacement
+  # coming, so removal IS the whole operation — no window to leave open.
   for stale in $(mr_slots_to_remove "$slots" "$MR_LAUNCH_AGENTS"); do
     mr_log "slots: removing slot ${stale} (SLOTS=${slots})"
     mr_bootout_slot "$stale"
@@ -394,20 +408,22 @@ mr_converge_slots() {
     mr_summary_add removed "slot ${stale}"
   done
 
+  # The legacy hand-provisioned layout is NOT deleted separately. Its plist
+  # sits at the same path as the slot's new one, so the normal
+  # bootout -> write -> bootstrap below replaces it in one step — and a legacy
+  # plist can never match the rendered secretless one, so it always takes that
+  # path. Deleting it up front only opened a window where a later failure left
+  # the host with no agents at all. This loop just records the migration.
   for legacy in $(mr_legacy_slots "$MR_LAUNCH_AGENTS"); do
-    mr_log "slots: slot ${legacy} is the legacy layout with the token embedded in its plist — migrating"
-    mr_bootout_slot "$legacy"
-    rm -f "$(mr_plist_path "$legacy")"
-    mr_summary_add changed "slot ${legacy} migrated off the embedded credential"
+    if [ "$legacy" -le "$slots" ]; then
+      mr_log "slots: slot ${legacy} is the legacy layout with the token embedded in its plist — replacing it"
+      mr_summary_add changed "slot ${legacy} migrated off the embedded credential"
+    fi
   done
 
   for slot in $(seq 1 "$slots"); do
     path="$(mr_plist_path "$slot")"
-    log_path="$(mr_default_log_path "$slot")"
-    rendered="$(mr_render_plist "$MR_PLIST_TMPL" "$slot" "$image" "$labels" "$log_path" "$MR_GH_ORG")" || {
-      mr_err "could not render the launchd plist for slot ${slot}. Nothing was loaded; re-running this command is safe."
-      return "$MR_EXIT_CONVERGE"
-    }
+    rendered="$(cat "${staging}/slot${slot}.plist")"
 
     if [ -f "$path" ] && [ "$rendered" = "$(cat "$path")" ] && \
        launchctl print "${MR_GUI_DOMAIN}/$(mr_plist_label "$slot")" >/dev/null 2>&1; then
@@ -416,15 +432,43 @@ mr_converge_slots() {
     fi
 
     mr_bootout_slot "$slot"
-    printf '%s\n' "$rendered" > "$path" || return "$MR_EXIT_CONVERGE"
+    cp "${staging}/slot${slot}.plist" "$path" || return "$MR_EXIT_CONVERGE"
     if ! launchctl bootstrap "$MR_GUI_DOMAIN" "$path"; then
-      mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule."
+      mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule. The plist is in place, so a re-run from the GUI session loads it."
       return "$MR_EXIT_CONVERGE"
     fi
     mr_log "slots: slot ${slot} loaded on ${image}"
     mr_summary_add changed "slot ${slot}"
   done
   return 0
+}
+
+# Two phases, deliberately: render everything, then change the host.
+#
+# These used to be one loop that removed the legacy plists first and rendered
+# each replacement as it went. A render failure partway through therefore left
+# the host with its old agents unloaded and deleted and no new ones — on the
+# live host, mobile CI silently stops — while the error said "Nothing was
+# loaded; re-running this command is safe", which was not true.
+mr_converge_slots() {
+  local slots="$1" image="$2" staging rc
+
+  mkdir -p "$MR_LAUNCH_AGENTS" || return "$MR_EXIT_CONVERGE"
+
+  staging="$(mktemp -d)" || {
+    mr_err "could not create a staging directory for the slot plists."
+    return "$MR_EXIT_CONVERGE"
+  }
+
+  if ! mr_render_all_slots "$slots" "$image" "$staging"; then
+    rm -rf "$staging"
+    return "$MR_EXIT_CONVERGE"
+  fi
+
+  mr_apply_slot_converge "$slots" "$image" "$staging"
+  rc=$?
+  rm -rf "$staging"
+  return "$rc"
 }
 
 # --- verify (FR-007) --------------------------------------------------------
