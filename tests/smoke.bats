@@ -1,25 +1,78 @@
 #!/usr/bin/env bats
-# Harness smoke test (ZUK-2150) — proves the bats CI job runs and pins the
-# invariants of what this repo owns.
-#
-# The IMAGE_VERSION format test and the packer/build.sh executable check were
-# removed when the image template moved to zukan's infra/mobile-ci/packer/:
-# this repo no longer carries either file, so those assertions pinned nothing
-# here. The template's own invariants are covered where it now lives.
+# Repo invariants (ZUK-2150) — the things that must stay true about what this
+# repo owns, independent of any one helper's behavior.
+
+load helper
+
+setup() {
+  REPO="$BATS_TEST_DIRNAME/.."
+}
 
 @test "agent script is executable" {
-  [ -x "$BATS_TEST_DIRNAME/../agent/mobile-runner-agent.sh" ]
+  [ -x "$REPO/agent/mobile-runner-agent.sh" ]
+}
+
+@test "install.sh exists and is executable — it is the product" {
+  # The README publishes a curl|bash one-liner pointing at this path on HEAD.
+  # For most of this repo's life the file was missing and that command 404'd.
+  [ -f "$REPO/install.sh" ]
+  [ -x "$REPO/install.sh" ]
+}
+
+@test "every shell file is parseable by bash 3.2" {
+  # /bin/bash on macOS is still 3.2 and there is no point at which this code is
+  # guaranteed a newer one: the entrypoint runs before Homebrew exists, it
+  # `exec bash lib/install-main.sh` (still /bin/bash unless someone has put a
+  # brewed bash first on PATH), and the agent's launchd plist puts
+  # /opt/homebrew/bin ahead of /bin but installs no bash there. A bash-4
+  # construct in any of these breaks a fresh install with a syntax error.
+  [ -x /bin/bash ] || skip "no /bin/bash"
+  local f
+  for f in "$REPO"/install.sh "$REPO"/lib/*.sh "$REPO"/agent/*.sh; do
+    run /bin/bash -n "$f"
+    [ "$status" -eq 0 ] || {
+      echo "not bash-3.2 parseable: $f"
+      echo "$output"
+      return 1
+    }
+  done
+}
+
+@test "every shell file parses" {
+  local f
+  for f in "$REPO"/install.sh "$REPO"/lib/*.sh "$REPO"/agent/*.sh; do
+    run bash -n "$f"
+    [ "$status" -eq 0 ] || {
+      echo "failed to parse: $f"
+      return 1
+    }
+  done
 }
 
 @test "plist template carries no credential value" {
-  ! grep -E "ghp_|github_pat_" "$BATS_TEST_DIRNAME/../agent/com.zukan.mobile-runner-agent.plist.tmpl"
+  ! grep -E "ghp_|github_pat_" "$REPO/agent/com.zukan.mobile-runner-agent.plist.tmpl"
+}
+
+@test "no shell file carries a credential value" {
+  ! grep -rE "ghp_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9_]{20}" \
+      "$REPO/install.sh" "$REPO/lib" "$REPO/agent"
+}
+
+@test "IMAGE_VERSION pin exists and holds one valid version (FR-015)" {
+  # The pin is the fleet's image audit trail and the default source of the
+  # version every install pulls. It briefly lived in the zukan monorepo
+  # instead — which is private, so the public installer could not read it.
+  [ -f "$REPO/IMAGE_VERSION" ]
+  # shellcheck source=/dev/null
+  source "$REPO/lib/common.sh"
+  run mr_read_pin "$REPO/IMAGE_VERSION"
+  [ "$status" -eq 0 ]
 }
 
 @test "no stale in-repo copy of the image template has reappeared" {
-  # The fork here drifted to a pre-ZUK-2131 template building Xcode 26.5 while
-  # zukan built 26.6 — an image that cannot honestly carry the xcode-26.6
-  # capability label the mobile workflows gate on. One source of truth: if a
-  # packer/ dir or IMAGE_VERSION pin shows up here again, that drift is back.
-  [ ! -e "$BATS_TEST_DIRNAME/../packer" ]
-  [ ! -e "$BATS_TEST_DIRNAME/../IMAGE_VERSION" ]
+  # The packer fork here drifted to a pre-ZUK-2131 template building Xcode
+  # 26.5 while zukan built 26.6 — an image that cannot honestly carry the
+  # xcode-26.6 capability label the mobile workflows gate on. The template has
+  # one home (zukan's infra/mobile-ci/packer/); the PIN has one home (here).
+  [ ! -e "$REPO/packer" ]
 }
