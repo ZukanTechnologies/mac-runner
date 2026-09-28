@@ -12,7 +12,7 @@
 #   4. exec lib/install-main.sh out of that clone
 #
 # Everything else lives in the clone, so a single run uses one consistent
-# revision of the agent, template and pin — no per-file raw URLs, no skew.
+# revision of the installer and its pins — no per-file raw URLs, no skew.
 #
 # bash 3.2 only: this is parsed by /bin/bash on a stock Mac, before Homebrew
 # exists. No associative arrays, no `mapfile`, no `${var^^}`.
