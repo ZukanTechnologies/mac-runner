@@ -1,0 +1,7 @@
+# The troymccabe/setup commit this host's runner engine is built from.
+# Tag: mac-runner/v1.1.0
+#
+# A commit sha, never a tag or branch: tags can be moved and branches always
+# move, and either would silently change what every host installs. Bump this
+# together with SETUP_SHA256.
+b72dab9d8384ed5757aa8f9b23f4ac4e9ce4265a

@@ -24,6 +24,25 @@ MR_DEFAULT_SLOTS="${MR_DEFAULT_SLOTS:-2}"
 MR_IMAGE_PREFIX="zukan-mobile-runner"
 MR_REGISTRY="${MR_REGISTRY:-ghcr.io/zukantechnologies}"
 MR_LABEL_PREFIX="com.zukan.mobile-runner-agent"
+
+# The engine. This repo does not implement the runner loop — it pins a
+# revision of troymccabe/setup, verifies it, and hands it Zukan's opinions.
+MR_SETUP_REPO="${MR_SETUP_REPO:-troymccabe/setup}"
+MR_SETUP_PATH="${MR_SETUP_PATH:-mac/runner/setup}"
+
+# Fleet identity. SHARED_LABEL is what workflows route on; capability labels
+# (xcode-*, macos-major-*, image-*) are PROBED from the booted VM by the
+# engine and must never be asserted here.
+MR_RUNNER_GROUP="${MR_RUNNER_GROUP:-macos-fleet}"
+MR_SHARED_LABEL="${MR_SHARED_LABEL:-mobile-runner}"
+MR_OP_ITEM_REF="${MR_OP_ITEM_REF:-op://mac-runner/runner-jit-pat/credential}"
+
+# Per-VM sizing. Actual concurrency is gated by RAM, not by SLOTS: each engine
+# install waits for VM_MEMORY_MB + HOST_RESERVE_MB to be free, so a 16 GB host
+# serialises two slots and a larger one runs them side by side.
+MR_VM_MEMORY_MB="${MR_VM_MEMORY_MB:-12288}"
+MR_VM_CPU_COUNT="${MR_VM_CPU_COUNT:-6}"
+MR_HOST_RESERVE_MB="${MR_HOST_RESERVE_MB:-4096}"
 # Slack on top of "room for a second copy of the image", for the runner's own
 # work dirs and the OS.
 MR_DISK_HEADROOM_GB="${MR_DISK_HEADROOM_GB:-20}"
@@ -308,52 +327,154 @@ mr_launch_agents_dir() { printf '%s\n' "${MR_LAUNCH_AGENTS:-${HOME}/Library/Laun
 mr_plist_path()        { printf '%s/%s.slot%s.plist\n' "$(mr_launch_agents_dir)" "$MR_LABEL_PREFIX" "$1"; }
 mr_default_log_path() { printf '/tmp/zukan-mobile-runner-agent.slot%s.log\n' "$1"; }
 
-# --- plist render (FR-009) --------------------------------------------------
+# --- engine pin -------------------------------------------------------------
 
-# Values are substituted into XML <string> elements, so & < > would produce an
-# unparseable plist — and launchd's diagnostic for a malformed plist is opaque
-# enough that the failure would land on the operator, not here. `&` and `\` are
-# also active in a sed replacement, and `|` is the delimiter. Every legitimate
-# value (image name, label list, log path) is plain ASCII, so reject rather
-# than escape: a value that needs escaping is a bug upstream.
-mr_value_is_renderable() {
-  case "$1" in
-    *"&"*|*"<"*|*">"*|*"|"*|*"\\"*|*"$MR_NL"*) return 1 ;;
-  esac
-  return 0
-}
-
-mr_render_plist() {
-  local tmpl="$1" slot="$2" image="$3" labels="$4" log_path="$5" org="${6:-ZukanTechnologies}" v out
-
-  mr_validate_slots "$slot" || return 1
-  if [ ! -r "$tmpl" ]; then
-    mr_err "plist template missing or unreadable: ${tmpl}"
+# Read a single-value pin file that may carry `#` comments. IMAGE_VERSION is a
+# bare value read by mr_read_pin; these pins are a commit sha and a checksum,
+# which are unreadable to a human without a note saying what they point at.
+mr_read_ref_pin() {
+  local file="$1" values count
+  if [ -z "$file" ]; then
+    mr_err "mr_read_ref_pin: no pin file given"
     return 1
   fi
+  if [ ! -r "$file" ]; then
+    mr_err "pin file missing or unreadable: ${file}"
+    return 1
+  fi
+  values="$(awk '{sub(/#.*/, "")} {gsub(/^[ \t]+|[ \t]+$/, "")} NF' "$file")"
+  count="$(printf '%s\n' "$values" | grep -c '[^[:space:]]')"
+  if [ "$count" -ne 1 ]; then
+    mr_err "pin file must hold exactly one value, found ${count}: ${file}"
+    return 1
+  fi
+  printf '%s\n' "$values"
+}
 
-  for v in "$image" "$labels" "$log_path" "$org"; do
-    if ! mr_value_is_renderable "$v"; then
-      mr_err "refusing to render slot ${slot}: value contains a character that would break the plist XML ('${v}')"
-      return 1
-    fi
-  done
-
-  out="$(sed -e "s|{{SLOT}}|${slot}|g" \
-             -e "s|{{BASE_IMAGE}}|${image}|g" \
-             -e "s|{{EXTRA_LABELS}}|${labels}|g" \
-             -e "s|{{LOG_PATH}}|${log_path}|g" \
-             -e "s|{{GH_ORG}}|${org}|g" \
-             "$tmpl")" || return 1
-
-  case "$out" in
-    *"{{"*)
-      mr_err "plist template still has an unsubstituted placeholder — template and installer are out of sync"
-      return 1
-      ;;
+# A commit sha, never a tag or branch: tags can be moved and branches always
+# move, and either would silently change what every host installs.
+mr_commit_is_valid() {
+  case "$1" in
+    *[!0-9a-f]*|"") return 1 ;;
   esac
+  [ "${#1}" -eq 40 ]
+}
 
+mr_sha256_is_valid() {
+  case "$1" in
+    *[!0-9a-f]*|"") return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ]
+}
+
+mr_setup_url() {
+  printf 'https://raw.githubusercontent.com/%s/%s/%s\n' \
+    "$MR_SETUP_REPO" "$1" "$MR_SETUP_PATH"
+}
+
+# --- slot -> engine environment ---------------------------------------------
+
+# Each slot is one engine install. Three things must differ between them or
+# they collide destructively; VM_PREFIX is the one that is not merely tidiness,
+# because every install reaps the VMs carrying its prefix at startup.
+mr_vm_prefix()       { printf 'ephem-s%s-\n' "$1"; }
+mr_slot_config_dir() { printf '%s/.gha-runner/slot%s\n' "${HOME}" "$1"; }
+
+# Labels this repo asserts, minus anything the engine probes.
+#
+# The engine reads macos-major-*, xcode-* and image-* out of the booted VM and
+# DROPS static ones, because a label taken from config says what should be in
+# the image while only the VM knows what is — and an asserted label that has
+# drifted routes a job confidently to the wrong toolchain. Stripping them here
+# makes the drop visible in this repo instead of a surprise in the engine log.
+mr_extra_labels() {
+  local raw="${RUNNER_EXTRA_LABELS:-}" out="" l lower
+  local IFS=,
+  for l in $raw; do
+    l="$(mr_trim "$l")"
+    [ -n "$l" ] || continue
+    lower="$(printf '%s' "$l" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+      macos-major-*|xcode-*|image-*) continue ;;
+    esac
+    out="${out:+${out},}${l}"
+  done
   printf '%s\n' "$out"
+}
+
+# Any RUNNER_EXTRA_LABELS entry the engine would discard, so the installer can
+# say so once rather than leaving the operator to wonder why a label they set
+# never appeared on a runner.
+mr_dropped_labels() {
+  local raw="${RUNNER_EXTRA_LABELS:-}" out="" l lower
+  local IFS=,
+  for l in $raw; do
+    l="$(mr_trim "$l")"
+    [ -n "$l" ] || continue
+    lower="$(printf '%s' "$l" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+      macos-major-*|xcode-*|image-*) out="${out:+${out}, }${l}" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
+# The COMPLETE environment one slot's engine install runs with, as KEY=VALUE
+# lines. Pure — no side effects — so the mapping from Zukan's opinions to the
+# engine's inputs is a unit-testable decision rather than an inline argument
+# list nobody can check without a Mac.
+mr_slot_env() {
+  local slot="$1" image="$2" runner_version="$3"
+  mr_validate_slots "$slot" || return 1
+  if [ -z "$image" ] || [ -z "$runner_version" ]; then
+    mr_err "mr_slot_env: image and runner version are both required"
+    return 1
+  fi
+  printf 'GH_ORG=%s\n'          "$MR_GH_ORG"
+  printf 'RUNNER_GROUP=%s\n'    "$MR_RUNNER_GROUP"
+  printf 'SHARED_LABEL=%s\n'    "$MR_SHARED_LABEL"
+  printf 'EXTRA_LABELS=%s\n'    "$(mr_extra_labels)"
+  printf 'BASE_IMAGE=%s\n'      "$image"
+  printf 'RUNNER_VERSION=%s\n'  "$runner_version"
+  # A mobile-runner image with no Xcode is a broken image, not a legitimate
+  # one, so recycle the VM rather than register it without an xcode-* label.
+  printf 'REQUIRE_XCODE=%s\n'   "1"
+  printf 'OP_ITEM_REF=%s\n'     "$MR_OP_ITEM_REF"
+  printf 'OP_TOKEN_FILE=%s\n'   "$MR_TOKEN_FILE"
+  printf 'LAUNCHD_LABEL=%s\n'   "$(mr_plist_label "$slot")"
+  printf 'CONFIG_DIR=%s\n'      "$(mr_slot_config_dir "$slot")"
+  printf 'VM_PREFIX=%s\n'       "$(mr_vm_prefix "$slot")"
+  printf 'VM_MEMORY_MB=%s\n'    "$MR_VM_MEMORY_MB"
+  printf 'VM_CPU_COUNT=%s\n'    "$MR_VM_CPU_COUNT"
+  printf 'HOST_RESERVE_MB=%s\n' "$MR_HOST_RESERVE_MB"
+}
+
+mr_file_sha256() {
+  [ -r "$1" ] || return 1
+  shasum -a 256 "$1" | cut -d' ' -f1
+}
+
+# Which of a slot's engine inputs differ from what is on the host.
+#
+# Reads that slot's config.env on stdin and prints one KEY per differing
+# value. This is what makes a re-run idempotent without re-running the engine
+# blindly: the engine writes its inputs to config.env, so comparing against
+# them is comparing against what the host is actually running.
+#
+# LAUNCHD_LABEL and CONFIG_DIR are excluded because the engine does not record
+# them in config.env — they are how it was addressed, not what it was told.
+mr_slot_drift() {
+  local slot="$1" image="$2" runner_version="$3" cfg line key want have
+  cfg="$(cat)"
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    want="${line#*=}"
+    case "$key" in
+      LAUNCHD_LABEL|CONFIG_DIR) continue ;;
+    esac
+    have="$(printf '%s\n' "$cfg" | sed -n "s/^${key}=\"\(.*\)\"\$/\1/p" | tail -1)"
+    [ "$have" = "$want" ] || printf '%s\n' "$key"
+  done < <(mr_slot_env "$slot" "$image" "$runner_version")
 }
 
 # --- reconciliation (FR-006) ------------------------------------------------
@@ -517,9 +638,9 @@ mr_inflight_action() {
 # apart (exit 20 "distinguished from bad token"). Never echo op's raw output:
 # it can carry vault metadata into a log.
 #
-# agent/mobile-runner-agent.sh deliberately carries its own copy of this
-# logic: it runs from /opt/zukan/mobile-runner-agent.sh, a standalone copy
-# outside the clone, so it cannot source this file.
+# This classifies failures of the INSTALL-TIME op read only. The engine does
+# its own per-cycle op read and classifies failures itself — it runs from
+# /opt/zukan/gha-runner-setup, outside this clone, so it cannot source this.
 mr_op_error_class() {
   case "$1" in
     *"isn't an item"*|*"not found"*|*"no vault"*|*"isn't a vault"*)
