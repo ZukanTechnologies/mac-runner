@@ -235,22 +235,16 @@ mr_resolve_image_version() {
   mr_read_pin "$pin_file"
 }
 
-# The name a host's agent clones from, and the value the installer renders into
-# every plist's BASE_IMAGE.
-#
-# This is the fully-qualified OCI reference, NOT the bare local name. `tart
-# pull` puts a remote image in the OCI cache (~/.tart/cache/OCIs/); it does not
-# create a locally-runnable VM under a bare name. `tart clone <ref> <vm>` reads
-# straight from that cache. The bare name exists only on the Mac that ran
-# packer, which is why zukan's build.sh epilogue says to point BASE_IMAGE at
-# "${IMAGE} (or the GHCR ref)" — every host but the build host needs the ref.
+# The registry reference the image step clones FROM (`tart clone <ref>
+# <local>`). Slots never clone this directly: it lives in the OCI cache, which
+# Tart auto-prunes under disk pressure.
 mr_base_image_ref() {
   printf '%s/%s:%s\n' "$MR_REGISTRY" "$MR_IMAGE_PREFIX" "$1"
 }
 
-# The bare local-VM name. Still meaningful on a build host, where packer leaves
-# one behind, and on hosts provisioned before the pull/clone distinction was
-# understood — so the prune path has to recognize it.
+# The bare local-VM name: what every slot's BASE_IMAGE names and clones per job,
+# and what verify checks for. Local VMs live in ~/.tart/vms and are never
+# auto-pruned. A Mac that ran packer already has one, so it skips the pull.
 mr_base_image_name() {
   printf '%s-%s\n' "$MR_IMAGE_PREFIX" "$1"
 }
@@ -277,14 +271,9 @@ mr_image_version_of() {
 # Is the exact reference the agents clone from on this host? Reads names on
 # stdin.
 #
-# Deliberately an EXACT match on the reference, not "some shape of this
-# version". A host that already has the bare local VM — the Mac that built the
-# image, or one provisioned before the pull/clone distinction was understood —
-# has nothing the agent can use: the plist says clone the registry reference,
-# and that reference is not in the OCI cache. Accepting the bare name here
-# would skip the GHCR login and pull, and the first agent cycle would then try
-# to fetch the image itself with no registry credentials established. So the
-# bare name means "still needs pulling", which is exactly right.
+# Deliberately an EXACT match, not "some shape of this version": the image step
+# and verify both ask for the bare local VM name (what every slot clones), and
+# an OCI-cache entry of the same version must not stand in for it.
 mr_image_ref_present() {
   local want="$1" name
   [ -n "$want" ] || return 1

@@ -632,15 +632,26 @@ mr_verify_no_leftovers() {
   return "$ok"
 }
 
+# Is the pinned image on this host in the form the slots clone from? That is
+# the bare LOCAL VM (the BASE_IMAGE mr_slot_env renders), not the
+# registry reference: `tart clone <ref> <local>` leaves an OCI-cache copy too,
+# but Tart auto-prunes that cache under disk pressure, so demanding it failed
+# verify on every later re-run of a healthy host.
+mr_verify_image() {
+  local local_name
+  local_name="$(mr_base_image_name "$1")"
+  if mr_tart_json | mr_image_names | mr_image_ref_present "$local_name"; then
+    mr_log "verify: image ${local_name} present"
+  else
+    mr_err "verify: local VM ${local_name} is not on this host — every slot clones it. Re-run this command to materialise it."
+    return 1
+  fi
+}
+
 mr_verify() {
   local slots="$1" version="$2" slot failures=0 pat waited hosttag
 
-  if mr_tart_json | mr_image_names | mr_image_ref_present "$(mr_base_image_ref "$version")"; then
-    mr_log "verify: image $(mr_base_image_ref "$version") present"
-  else
-    mr_err "verify: $(mr_base_image_ref "$version") is not on this host — the agents clone that reference, so a bare local copy of the same version is not a substitute"
-    failures=$((failures + 1))
-  fi
+  mr_verify_image "$version" || failures=$((failures + 1))
 
   for slot in $(seq 1 "$slots"); do
     if launchctl print "${MR_GUI_DOMAIN}/$(mr_plist_label "$slot")" >/dev/null 2>&1; then
