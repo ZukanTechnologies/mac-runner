@@ -2,4 +2,4 @@
 #
 # Checked before the script is executed. The pin says WHICH revision; this says
 # the bytes we got are that revision — a pinned URL still traverses the network.
-c1a1245c4cd53e076eb2690e26d07ccf6f9275f6b064802f0851522f73cb0bfc
+2fb582865eea452ec8913085fd7135f55597c47f557124c7bfecd5d3ad73b89a
