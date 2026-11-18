@@ -1,0 +1,7 @@
+# actions/runner version every ephemeral VM runs.
+#
+# AUTHORITATIVE, not a fallback: the engine replaces a runner baked into the
+# image when it disagrees with this. Bump when GitHub deprecates a release — a
+# deprecated runner registers fine and is then refused at the broker, so it
+# presents as a runner that goes offline seconds after appearing.
+2.337.0

@@ -1,8 +1,10 @@
 # mac-runner
 
-One-command provisioning for Zukan's **ephemeral Mac CI runner hosts** — Apple-Silicon Macs that run GitHub Actions jobs inside disposable [Tart](https://tart.run) VMs (labels `self-hosted, mobile-runner, macos, arm64`).
+One-command provisioning for Zukan's **ephemeral Mac CI runner hosts** — Apple-Silicon Macs that run GitHub Actions jobs inside disposable [Tart](https://tart.run) VMs.
 
 Lifecycle per job: `tart clone` the base image → boot → JIT-register a **single-job** GitHub runner → run exactly one job → delete the VM. No state survives between jobs, so there is no config drift.
+
+**This repo does not implement that loop.** It is an opinionated wrapper around [`troymccabe/setup`](https://github.com/troymccabe/setup)'s `mac/runner/setup`, which is the engine. This repo owns Zukan's *opinions* — which image, which runner version, which labels, how many slots, where the credential lives — and the host lifecycle around them. See [Architecture](#architecture-this-repo-pins-an-engine).
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ZukanTechnologies/mac-runner/HEAD/install.sh)"
@@ -24,11 +26,16 @@ The default install asks nothing beyond the token. Overrides are env-var prefixe
 
 | Var | Default | Meaning |
 |---|---|---|
-| `SLOTS` | `2` | VM slots (max 2 — Apple Virtualization caps concurrent VMs per host) |
-| `RUNNER_EXTRA_LABELS` | *(empty)* | Comma-separated labels appended to `mobile-runner,macos,arm64` |
-| `IMAGE_VERSION` | the repo's [`IMAGE_VERSION`](IMAGE_VERSION) pin | Escape hatch for pulling a version other than the blessed pin |
+| `SLOTS` | `2` | VM slots (max 2 — Apple Virtualization caps concurrent VMs per host). Each slot is one engine install; actual concurrency is gated by RAM, so a 16 GB host serialises two slots |
+| `RUNNER_EXTRA_LABELS` | *(empty)* | Comma-separated labels for capabilities **the VM cannot report** (e.g. `maestro`). `macos-major-*` / `xcode-*` / `image-*` entries are stripped — those are probed. Runners always carry `self-hosted, macOS, arm64` plus `mobile-runner` and the host label |
+| `IMAGE_VERSION` | the repo's [`IMAGE_VERSION`](IMAGE_VERSION) pin | Escape hatch for a version other than the blessed pin |
+| `RUNNER_VERSION` | the repo's [`RUNNER_VERSION`](RUNNER_VERSION) pin | `actions/runner` version every VM runs. **Authoritative** — a runner baked into the image is replaced when it disagrees |
 | `FORCE` | `0` | `1` = don't wait for idle slots; terminates in-flight CI VMs (they retry on re-run) |
 | `GH_ORG` | `ZukanTechnologies` | Org used for JIT registration and the post-install verification |
+| `MR_RUNNER_GROUP` | `macos-fleet` | Org runner group the slots register into |
+| `MR_SHARED_LABEL` | `mobile-runner` | The fleet label workflows route on |
+| `MR_VM_MEMORY_MB` / `MR_VM_CPU_COUNT` | `12288` / `6` | Per-VM sizing handed to the engine |
+| `MR_HOST_RESERVE_MB` | `4096` | RAM kept free for the host; this is what gates real concurrency |
 | `OP_SERVICE_ACCOUNT_TOKEN` | *(prompted)* | Pre-supplying it skips the interactive prompt, for scripted installs |
 
 ```bash
@@ -44,12 +51,50 @@ It converges the host — observe, then change only what differs — in this ord
 3. **Toolchain**: `sudo pmset` (no sleep), Homebrew, `jq`, `1password-cli`, `cirruslabs/cli/tart`, `sshpass`.
 4. **Itself**: clones/updates this repo to `/opt/zukan/mac-runner` and re-execs from there, so one run uses one consistent revision.
 5. **Secrets**: prompts once for the service-account token, stores it `0600`, validates it, signs in to `ghcr.io` with the op-read pull PAT.
-6. **Image**: pulls the pinned version, re-checking free disk against the real requirement first.
-7. **Slots**: waits for in-flight CI jobs to finish (`FORCE=1` skips), then renders and loads one launchd agent per slot; removes slots beyond `SLOTS` and migrates any legacy plist that has a credential embedded in it.
-8. **Prune**: removes superseded images — *after* the slots are running on the new one.
-9. **Verify + report**: image at pin, agents loaded, a runner from this host visible in the org listing, then a summary of what was installed / changed / removed / unchanged.
+6. **Engine**: fetches `mac/runner/setup` at the `SETUP_VERSION` commit, **verifies its sha256 against `SETUP_SHA256`**, and installs it at `/opt/zukan/gha-runner-setup`. A mismatch refuses to run it.
+7. **Image**: materialises the pinned version as a **local** Tart VM, re-checking free disk against the real requirement first.
+8. **Slots**: waits for in-flight CI jobs to finish (`FORCE=1` skips), then runs the engine once per slot; removes slots beyond `SLOTS` and migrates any legacy plist that has a credential embedded in it.
+9. **Prune**: removes superseded images — *after* the slots are running on the new one.
+10. **Verify + report**: image at pin, agents loaded, a runner from this host visible in the org listing, then a summary of what was installed / changed / removed / unchanged.
 
 Every step is safe to interrupt. Re-running resumes.
+
+## Architecture: this repo pins an engine
+
+```
+ZukanTechnologies/mac-runner   ← opinions + host lifecycle (this repo)
+        │  SETUP_VERSION  commit sha of the engine
+        │  SETUP_SHA256   checksum of the file at that commit
+        │  IMAGE_VERSION  which base image
+        │  RUNNER_VERSION which actions/runner
+        ▼
+troymccabe/setup  mac/runner/setup   ← the engine: orchestrator loop,
+                                       JIT registration, capability probing,
+                                       VM lifecycle, launchd agent
+```
+
+One slot = one engine install. Three inputs must differ between slots, and the installer derives all three:
+
+| Slot | `LAUNCHD_LABEL` | `CONFIG_DIR` | `VM_PREFIX` |
+|---|---|---|---|
+| 1 | `com.zukan.mobile-runner-agent.slot1` | `~/.gha-runner/slot1` | `ephem-s1-` |
+| 2 | `com.zukan.mobile-runner-agent.slot2` | `~/.gha-runner/slot2` | `ephem-s2-` |
+
+`VM_PREFIX` is the one that is not merely tidiness. Each engine reaps the VMs carrying its prefix **at startup** — which happens on a KeepAlive restart and at every login, not just on install — so two slots sharing a prefix would destroy each other's running jobs. Prefixes must be *disjoint*, not merely different: matching is `startswith`, so `ephem-` would also match `ephem-s1-…`.
+
+### Why pin rather than vendor
+
+`SETUP_VERSION` is a **commit sha, never a tag or branch**: tags can be moved and branches always move, and either would silently change what every host installs. `SETUP_SHA256` is checked before the file is executed — the pin says *which* revision, the checksum says the bytes we got *are* that revision, and a pinned URL still traverses the network.
+
+Bumping the engine is those two files plus a re-run. They must move together; the installer refuses on mismatch and names both sides.
+
+### Capability labels are probed, never asserted
+
+The engine SSHes into each booted VM and reads `sw_vers` and `xcodebuild -version` before registering, so it owns the `macos-major-*`, `xcode-*` and `image-*` namespaces. **Entries in those namespaces are stripped from `RUNNER_EXTRA_LABELS`** and the installer says so once.
+
+A static capability label says what *should* be in the image; only the VM knows what *is*. An asserted label that has drifted is worse than no gate at all — it routes a job confidently to the wrong toolchain. Put capabilities the VM cannot report (`maestro`, `node-22`) in `RUNNER_EXTRA_LABELS`; anything it *can* report comes from the probe.
+
+`REQUIRE_XCODE=1` is set for this fleet: a mobile-runner image with no Xcode is a broken image, so the VM is recycled rather than registered half-labelled.
 
 ## Credentials (1Password)
 
@@ -113,8 +158,9 @@ launchctl bootout  "gui/$(id -u)/com.zukan.mobile-runner-agent.slot1"   # stop
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist  # start
 launchctl kickstart -k "gui/$(id -u)/com.zukan.mobile-runner-agent.slot1"  # restart
 
-# Logs (per slot)
-tail -f /tmp/zukan-mobile-runner-agent.slot1.log
+# Logs (per slot) — the engine writes these
+tail -f ~/.gha-runner/slot1/orchestrator.log
+tail -f ~/.gha-runner/slot1/orchestrator.err
 ```
 
 ### Installer exit codes
@@ -145,48 +191,54 @@ Every non-zero exit prints a one-line remediation. Re-running the same command a
 
 ## Manual provisioning (fallback only)
 
-The installer automates all of this. It is kept here because it is what to fall back on if the installer itself is broken, and it is the fastest way to understand what a host is.
+If the installer cannot run, converge one slot by hand with the engine directly.
+Get the pinned engine and check it before running it:
 
 ```bash
-sudo pmset -a sleep 0 disksleep 0
+COMMIT=$(grep -v '^#' SETUP_VERSION | tr -d '[:space:]')
+WANT=$(grep -v '^#' SETUP_SHA256  | tr -d '[:space:]')
+curl -fsSL "https://raw.githubusercontent.com/troymccabe/setup/${COMMIT}/mac/runner/setup" -o /tmp/engine
+[ "$(shasum -a 256 /tmp/engine | cut -d' ' -f1)" = "$WANT" ] || { echo "checksum mismatch"; exit 1; }
+
 # System Settings → Users & Groups → "Automatically log in as <CI user>"
-
-brew install jq 1password-cli
-brew trust cirruslabs/cli && brew install cirruslabs/cli/tart
-brew install hudochenkov/sshpass/sshpass
-
-tart login ghcr.io --username <ghcr-pull-pat.username>   # paste ghcr-pull-pat.credential
-tart pull ghcr.io/zukantechnologies/zukan-mobile-runner:$(cat IMAGE_VERSION)
-
-sudo mkdir -p /opt/zukan && sudo chown "$(whoami)" /opt/zukan
-cp agent/mobile-runner-agent.sh /opt/zukan/ && chmod +x /opt/zukan/mobile-runner-agent.sh
-
-# One plist per slot (1..2): copy agent/com.zukan.mobile-runner-agent.plist.tmpl to
-# ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot<N>.plist and replace
-# {{SLOT}} {{BASE_IMAGE}} {{EXTRA_LABELS}} {{LOG_PATH}}, then:
-#
-# {{BASE_IMAGE}} is the full registry reference
-# (ghcr.io/zukantechnologies/zukan-mobile-runner:<version>), NOT a bare local
-# name — `tart pull` fills the OCI cache, not a runnable local VM, so a bare
-# name only resolves on the Mac that built the image.
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.zukan.mobile-runner-agent.slot1.plist
+# (FileVault must be off), then, from the logged-in GUI session:
+GH_ORG=ZukanTechnologies GH_PAT=<install-time PAT> \
+OP_ITEM_REF=op://mac-runner/runner-jit-pat/credential \
+RUNNER_GROUP=macos-fleet SHARED_LABEL=mobile-runner REQUIRE_XCODE=1 \
+BASE_IMAGE=zukan-mobile-runner-$(cat IMAGE_VERSION) \
+RUNNER_VERSION=$(grep -v '^#' RUNNER_VERSION | tr -d '[:space:]') \
+LAUNCHD_LABEL=com.zukan.mobile-runner-agent.slot1 \
+CONFIG_DIR="$HOME/.gha-runner/slot1" VM_PREFIX=ephem-s1- \
+  bash /tmp/engine
 ```
+
+`BASE_IMAGE` is a **local** Tart VM name, not a registry reference: `tart pull`
+fills the OCI cache, which Tart auto-prunes under disk pressure, and a per-job
+clone against a remote ref degenerates into re-downloading the image every
+cycle. The installer materialises the local VM for you; by hand, `tart clone
+ghcr.io/zukantechnologies/zukan-mobile-runner:<version>
+zukan-mobile-runner-<version>` first.
+
+For a second slot, repeat with `slot2` / `ephem-s2-`. The prefixes must not
+overlap — the engine refuses if they do.
 
 ## Repo layout
 
 | Path | What |
 |---|---|
 | `install.sh` | curl\|bash entrypoint: preflight, toolchain, clone, re-exec |
-| `lib/common.sh` | pure helpers — preflight predicates, plist render, pin parse, reconciliation |
-| `lib/install-main.sh` | the installer proper: secrets, image, slots, prune, verify, report |
+| `lib/common.sh` | pure helpers — preflight predicates, pin parse, slot→engine env, drift, reconciliation |
+| `lib/install-main.sh` | the installer proper: secrets, engine, image, slots, prune, verify, report |
+| `SETUP_VERSION` | commit sha of the engine (`troymccabe/setup`) |
+| `SETUP_SHA256` | checksum of `mac/runner/setup` at that commit |
 | `IMAGE_VERSION` | the blessed base-image version pin |
-| `agent/` | host slot-agent loop + launchd plist template |
+| `RUNNER_VERSION` | the `actions/runner` version every VM runs |
 | `tests/` | bats suite (run in CI on Linux and macOS, with shellcheck) |
 
 ### Working on this repo
 
 ```bash
-shellcheck install.sh lib/*.sh agent/*.sh
+shellcheck install.sh lib/*.sh
 bats tests/
 ```
 

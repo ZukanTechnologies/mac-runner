@@ -25,14 +25,15 @@ MR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "${MR_ROOT}/lib/common.sh"
 
 MR_INSTALL_ROOT="${MR_INSTALL_ROOT:-/opt/zukan}"
-MR_AGENT_SRC="${MR_ROOT}/agent/mobile-runner-agent.sh"
-MR_AGENT_DEST="${MR_INSTALL_ROOT}/mobile-runner-agent.sh"
-MR_PLIST_TMPL="${MR_ROOT}/agent/com.zukan.mobile-runner-agent.plist.tmpl"
+# The engine is fetched, not vendored: SETUP_VERSION pins the revision and
+# SETUP_SHA256 proves the bytes. Nothing in this repo implements a runner loop.
+MR_SETUP_PIN_FILE="${MR_ROOT}/SETUP_VERSION"
+MR_SETUP_SHA_FILE="${MR_ROOT}/SETUP_SHA256"
+MR_ENGINE_DEST="${MR_INSTALL_ROOT}/gha-runner-setup"
 MR_PIN_FILE="${MR_ROOT}/IMAGE_VERSION"
+MR_RUNNER_PIN_FILE="${MR_ROOT}/RUNNER_VERSION"
 MR_LAUNCH_AGENTS="${MR_LAUNCH_AGENTS:-${HOME}/Library/LaunchAgents}"
-MR_TOKEN_FILE="${ZUKAN_OP_TOKEN_FILE:-${HOME}/.config/zukan-runner/op-token}"
 MR_VAULT="${MR_VAULT:-mac-runner}"
-MR_GH_ORG="${GH_ORG:-ZukanTechnologies}"
 MR_DISK_FLOOR_GB="${MR_DISK_FLOOR_GB:-120}"
 # How long to wait for a slot agent to register a runner before calling the
 # health check failed. Agents register at cycle start, so this is ~one clone.
@@ -189,14 +190,19 @@ mr_converge_toolchain() {
 mr_tart_json() { tart list --format json 2>/dev/null; }
 
 mr_converge_image() {
-  local version ref listing have_size need free
+  local version ref local_name listing have_size need free
   version="$1"
   ref="$(mr_base_image_ref "$version")"
+  # The per-job clone must run against a LOCAL VM, never a registry reference.
+  # `tart pull` only populates the OCI cache, which Tart auto-prunes under disk
+  # pressure — on a small SSD that degenerates into re-downloading the whole
+  # image every cycle. Local VMs are never auto-pruned.
+  local_name="$(mr_base_image_name "$version")"
   listing="$(mr_tart_json)"
 
-  if printf '%s' "$listing" | mr_image_names 2>/dev/null | mr_image_ref_present "$ref"; then
-    mr_log "image: ${ref} already present"
-    mr_summary_add unchanged "image ${ref}"
+  if printf '%s' "$listing" | mr_image_names 2>/dev/null | mr_image_ref_present "$local_name"; then
+    mr_log "image: ${local_name} already present"
+    mr_summary_add unchanged "image ${local_name}"
     return 0
   fi
 
@@ -234,12 +240,12 @@ mr_converge_image() {
   fi
   unset ghcr_pat
 
-  mr_log "image: pulling ${ref} (tens of GB — this is the slow part)"
-  if ! tart pull "$ref"; then
-    mr_err "could not pull ${ref}. Check that version exists in the registry (the IMAGE_VERSION pin) and that ghcr-pull-pat can read it. Re-run this command to resume."
+  mr_log "image: materialising ${ref} as local VM ${local_name} (tens of GB — this is the slow part)"
+  if ! tart clone "$ref" "$local_name"; then
+    mr_err "could not materialise ${ref}. Check that version exists in the registry (the IMAGE_VERSION pin) and that ghcr-pull-pat can read it. Re-run this command to resume."
     return "$MR_EXIT_REGISTRY"
   fi
-  mr_summary_add installed "image ${ref}"
+  mr_summary_add installed "image ${local_name}"
   return 0
 }
 
@@ -356,63 +362,85 @@ mr_bootout_slot() {
   launchctl bootout "${MR_GUI_DOMAIN}/${label}" >/dev/null 2>&1 || true
 }
 
-mr_converge_agent_script() {
+mr_converge_engine() {
+  local commit sha url tmp got
+
+  commit="$(mr_read_ref_pin "$MR_SETUP_PIN_FILE")" || return "$MR_EXIT_REMEDIABLE"
+  if ! mr_commit_is_valid "$commit"; then
+    mr_err "SETUP_VERSION must be a 40-character commit sha (got '${commit}'). A tag or branch would let the engine change under this host without the pin changing."
+    return "$MR_EXIT_REMEDIABLE"
+  fi
+  sha="$(mr_read_ref_pin "$MR_SETUP_SHA_FILE")" || return "$MR_EXIT_REMEDIABLE"
+  if ! mr_sha256_is_valid "$sha"; then
+    mr_err "SETUP_SHA256 must be a 64-character sha256 (got '${sha}')."
+    return "$MR_EXIT_REMEDIABLE"
+  fi
+
+  if [ -x "$MR_ENGINE_DEST" ] && [ "$(mr_file_sha256 "$MR_ENGINE_DEST")" = "$sha" ]; then
+    mr_summary_add unchanged "engine ${commit%"${commit#????????????}"}"
+    return 0
+  fi
+
   mkdir -p "$MR_INSTALL_ROOT" 2>/dev/null || {
     sudo mkdir -p "$MR_INSTALL_ROOT" && sudo chown "$(id -u):$(id -g)" "$MR_INSTALL_ROOT"
   } || return "$MR_EXIT_CONVERGE"
 
-  if [ -f "$MR_AGENT_DEST" ] && cmp -s "$MR_AGENT_SRC" "$MR_AGENT_DEST"; then
-    mr_summary_add unchanged "agent ${MR_AGENT_DEST}"
-    return 0
+  url="$(mr_setup_url "$commit")"
+  tmp="$(mktemp)" || return "$MR_EXIT_CONVERGE"
+  mr_log "engine: fetching ${MR_SETUP_REPO} @ ${commit}"
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    mr_err "could not fetch the engine from ${url}. Check network access to raw.githubusercontent.com; nothing on this host has been changed."
+    return "$MR_EXIT_REGISTRY"
   fi
 
-  # Write beside it and rename, never `cp` over the top. bash reads a script
-  # incrementally as it runs, so overwriting the file in place would splice new
-  # bytes into the agent that is running a CI job right now. A rename gives the
-  # new file a new inode; the running agent keeps reading the old one until the
-  # slot converge below restarts it.
-  local tmp="${MR_AGENT_DEST}.new.$$"
-  cp "$MR_AGENT_SRC" "$tmp" || return "$MR_EXIT_CONVERGE"
+  # The pin says WHICH revision; this says the bytes we got ARE that revision.
+  # A pinned URL still traverses the network, and this file is about to run as
+  # the CI user and install launchd agents.
+  got="$(mr_file_sha256 "$tmp")"
+  if [ "$got" != "$sha" ]; then
+    rm -f "$tmp"
+    mr_err "engine checksum mismatch — refusing to run it."
+    mr_err "  expected ${sha}"
+    mr_err "  got      ${got}"
+    mr_err "  If SETUP_VERSION was just bumped, SETUP_SHA256 must be bumped with it."
+    return "$MR_EXIT_REGISTRY"
+  fi
+
+  # Write beside it and rename, never over the top: a running agent reads its
+  # script incrementally, so overwriting in place splices new bytes into an
+  # engine that is mid-job. A rename gives the new file a new inode.
   chmod 755 "$tmp" || { rm -f "$tmp"; return "$MR_EXIT_CONVERGE"; }
-  mv -f "$tmp" "$MR_AGENT_DEST" || { rm -f "$tmp"; return "$MR_EXIT_CONVERGE"; }
-  mr_summary_add changed "agent ${MR_AGENT_DEST}"
+  mv -f "$tmp" "$MR_ENGINE_DEST" || { rm -f "$tmp"; return "$MR_EXIT_CONVERGE"; }
+  mr_summary_add changed "engine ${commit}"
   return 0
 }
 
-# Render every desired slot into a staging directory. Touches nothing on the
-# host — this is the phase that is allowed to fail.
-mr_render_all_slots() {
-  local slots="$1" image="$2" staging="$3" slot labels log_path
-  labels="${RUNNER_EXTRA_LABELS:-}"
-  for slot in $(seq 1 "$slots"); do
-    log_path="$(mr_default_log_path "$slot")"
-    if ! mr_render_plist "$MR_PLIST_TMPL" "$slot" "$image" "$labels" "$log_path" "$MR_GH_ORG" \
-         > "${staging}/slot${slot}.plist"; then
-      mr_err "could not render the launchd plist for slot ${slot}. Nothing on this host has been changed — every slot is rendered before any is touched — so re-running this command is safe."
-      return 1
-    fi
-  done
-  return 0
-}
-
-# Install one staged plist, with rollback.
+# Converge one slot by running the pinned engine against it.
 #
-# launchd has no atomic swap: replacing a slot's definition means bootout then
-# bootstrap, so there is an unavoidable window. Two things narrow it:
-#
-#   * the new plist is written BEFORE the old agent is unloaded, so a failed
-#     copy costs nothing — the running agent is untouched;
-#   * a failed bootstrap restores the previous definition and reloads it.
-#
-# The rollback matters most for the likeliest failure there is: running the
-# installer over ssh instead of in the GUI session. That fails bootstrap for
-# every slot, and without rollback it would take a working host down.
+# launchd has no atomic swap, so replacing a slot means the engine boots its
+# agent out and back in — an unavoidable window. The rollback below matters
+# most for the likeliest failure there is: running this over ssh instead of in
+# the GUI session, which fails to load the agent for every slot.
 #
 # Rolling back a legacy slot restores its plaintext-PAT plist. That is the
 # right trade: the credential was already on disk, and a host with no agent is
 # worse than a host still waiting to be migrated on the next run.
 mr_install_slot() {
-  local slot="$1" staged="$2" path backup
+  local slot="$1" image="$2" runner_version="$3"
+  local path backup rc line
+  local -a slot_env=()
+
+  while IFS= read -r line; do
+    slot_env+=("$line")
+  done < <(mr_slot_env "$slot" "$image" "$runner_version") || {
+    mr_err "could not build the engine environment for slot ${slot}."
+    return "$MR_EXIT_CONVERGE"
+  }
+  [ "${#slot_env[@]}" -gt 0 ] || {
+    mr_err "empty engine environment for slot ${slot} — refusing to run it."
+    return "$MR_EXIT_CONVERGE"
+  }
 
   path="$(mr_plist_path "$slot")"
   backup=""
@@ -424,51 +452,40 @@ mr_install_slot() {
     fi
   fi
 
-  if ! cp "$staged" "$path"; then
-    mr_err "could not write ${path}. The existing slot ${slot} agent is still loaded and untouched."
-    [ -n "$backup" ] && mv -f "$backup" "$path"
-    return "$MR_EXIT_CONVERGE"
-  fi
+  # GH_PAT is INSTALL-TIME ONLY. The engine uses it to ensure the runner group
+  # exists and then discards it: OP_ITEM_REF is set, so it records the vault
+  # reference and never writes the PAT to disk.
+  mr_log "slots: converging slot ${slot} (prefix $(mr_vm_prefix "$slot"))"
+  env "${slot_env[@]}" GH_PAT="$MR_INSTALL_PAT" bash "$MR_ENGINE_DEST"
+  rc=$?
 
-  mr_bootout_slot "$slot"
-  if launchctl bootstrap "$MR_GUI_DOMAIN" "$path"; then
+  if [ "$rc" -eq 0 ]; then
     [ -n "$backup" ] && rm -f "$backup"
     return 0
   fi
 
-  mr_err "launchctl could not load slot ${slot}. This must run in the logged-in GUI session (not over ssh, not as a LaunchDaemon) — see the README's host session rule."
-
+  mr_err "the engine failed to converge slot ${slot} (exit ${rc}). If it could not load the agent, this must run in the logged-in GUI session — not over ssh, not as a LaunchDaemon."
   if [ -n "$backup" ]; then
     mr_warn "restoring the previous slot ${slot} definition and reloading it"
     if ! mv -f "$backup" "$path"; then
-      # Without this check the next line would "roll back" by bootstrapping
-      # the new plist again — the one that just failed.
-      mr_warn "could not restore ${path} from ${backup}. The previous definition is still at ${backup}; move it back by hand and 'launchctl bootstrap ${MR_GUI_DOMAIN} ${path}'."
+      mr_warn "could not restore ${path} from ${backup}. Move it back by hand and 'launchctl bootstrap ${MR_GUI_DOMAIN} ${path}'."
       return "$MR_EXIT_CONVERGE"
     fi
     launchctl bootstrap "$MR_GUI_DOMAIN" "$path" >/dev/null 2>&1 \
       || mr_warn "could not reload the previous slot ${slot} agent either; this host has no agent on slot ${slot} until a successful run or a reboot"
-  else
-    # Leave the plist in place. It rendered fine — the usual reason bootstrap
-    # fails here is the environment (no GUI session), not the file — so
-    # RunAtLoad picks it up at the next login, and a re-run from the GUI
-    # session loads it immediately. Deleting it would guarantee that nothing
-    # ever loads instead.
-    mr_warn "the slot ${slot} plist is in place at ${path} but not loaded; it will load at the next login, or immediately if you re-run this from the GUI session"
   fi
   return "$MR_EXIT_CONVERGE"
 }
 
-# Install the staged plists. Only reached once every one of them rendered.
+# Converge the wanted slots, then retire the rest.
 mr_apply_slot_converge() {
-  local slots="$1" image="$2" staging="$3" slot path rendered stale legacy
+  local slots="$1" image="$2" runner_version="$3" slot cfg drift stale legacy
 
   mkdir -p "$MR_LAUNCH_AGENTS" || return "$MR_EXIT_CONVERGE"
 
   # The legacy hand-provisioned layout is NOT deleted separately. Its plist
-  # sits at the same path as the slot's new one, so mr_install_slot replaces it
-  # in one step — and a legacy plist can never match the rendered secretless
-  # one, so it always takes that path. This loop only records the migration.
+  # sits at the same path the engine writes, so converging replaces it in one
+  # step. This loop only records the migration.
   for legacy in $(mr_legacy_slots "$MR_LAUNCH_AGENTS"); do
     if [ "$legacy" -le "$slots" ]; then
       mr_log "slots: slot ${legacy} is the legacy layout with the token embedded in its plist — replacing it"
@@ -478,28 +495,28 @@ mr_apply_slot_converge() {
 
   # Bring up the slots we WANT first. Obsolete ones are retired only once
   # these are running, so a failure here can never leave the host with
-  # everything unloaded — reducing 2 slots to 1 used to delete slot 2 up
-  # front, so a slot 1 that then failed to bootstrap took both down.
+  # everything unloaded.
   for slot in $(seq 1 "$slots"); do
-    path="$(mr_plist_path "$slot")"
-    rendered="$(cat "${staging}/slot${slot}.plist")"
-
-    if [ -f "$path" ] && [ "$rendered" = "$(cat "$path")" ] && \
-       launchctl print "${MR_GUI_DOMAIN}/$(mr_plist_label "$slot")" >/dev/null 2>&1; then
-      mr_summary_add unchanged "slot ${slot}"
-      continue
+    cfg="$(mr_slot_config_dir "$slot")/config.env"
+    if [ -r "$cfg" ] \
+       && launchctl print "${MR_GUI_DOMAIN}/$(mr_plist_label "$slot")" >/dev/null 2>&1; then
+      drift="$(mr_slot_drift "$slot" "$image" "$runner_version" < "$cfg")"
+      if [ -z "$drift" ]; then
+        mr_summary_add unchanged "slot ${slot}"
+        continue
+      fi
+      mr_log "slots: slot ${slot} differs on $(printf '%s' "$drift" | tr '\n' ' ')"
     fi
 
-    mr_install_slot "$slot" "${staging}/slot${slot}.plist" || return "$MR_EXIT_CONVERGE"
-    mr_log "slots: slot ${slot} loaded on ${image}"
+    mr_install_slot "$slot" "$image" "$runner_version" || return "$MR_EXIT_CONVERGE"
     mr_summary_add changed "slot ${slot}"
   done
 
-  # Now that the wanted slots are up, retire the rest (US2-AC4).
   for stale in $(mr_slots_to_remove "$slots" "$MR_LAUNCH_AGENTS"); do
     mr_log "slots: removing slot ${stale} (SLOTS=${slots})"
     mr_bootout_slot "$stale"
     if rm -f "$(mr_plist_path "$stale")"; then
+      rm -rf "$(mr_slot_config_dir "$stale")"
       mr_summary_add removed "slot ${stale}"
     else
       mr_warn "unloaded slot ${stale} but could not delete $(mr_plist_path "$stale") — it will not load again, but remove it by hand"
@@ -509,33 +526,11 @@ mr_apply_slot_converge() {
   return 0
 }
 
-# Two phases, deliberately: render everything, then change the host.
-#
-# These used to be one loop that removed the legacy plists first and rendered
-# each replacement as it went. A render failure partway through therefore left
-# the host with its old agents unloaded and deleted and no new ones — on the
-# live host, mobile CI silently stops — while the error said "Nothing was
-# loaded; re-running this command is safe", which was not true.
-#
-# Nothing here touches the host, not even mkdir: the render phase writes only
-# into a staging directory, so "nothing has been changed" is literally true.
+# The engine owns rendering and loading, so there is nothing for this repo to
+# stage. What it still owns is ORDER: wanted slots up before stale ones go, so
+# a failure can never leave the host with nothing loaded.
 mr_converge_slots() {
-  local slots="$1" image="$2" staging rc
-
-  staging="$(mktemp -d)" || {
-    mr_err "could not create a staging directory for the slot plists."
-    return "$MR_EXIT_CONVERGE"
-  }
-
-  if ! mr_render_all_slots "$slots" "$image" "$staging"; then
-    rm -rf "$staging"
-    return "$MR_EXIT_CONVERGE"
-  fi
-
-  mr_apply_slot_converge "$slots" "$image" "$staging"
-  rc=$?
-  rm -rf "$staging"
-  return "$rc"
+  mr_apply_slot_converge "$1" "$2" "$3"
 }
 
 # --- verify (FR-007) --------------------------------------------------------
@@ -707,16 +702,21 @@ main() {
   # leaking into the caller turns any unset variable there into a hard failure.
   set -uo pipefail
 
-  local slots version ref rc
+  local slots version image runner_version rc dropped
 
   slots="$(mr_resolve_slots)" || exit "$MR_EXIT_REMEDIABLE"
   version="$(mr_resolve_image_version "$MR_PIN_FILE")" || exit "$MR_EXIT_REMEDIABLE"
-  # What every slot plist clones from; see mr_base_image_ref for why this is
-  # the registry reference and not the bare local name.
-  ref="$(mr_base_image_ref "$version")"
+  image="$(mr_base_image_name "$version")"
+  runner_version="$(mr_read_ref_pin "$MR_RUNNER_PIN_FILE")" || exit "$MR_EXIT_REMEDIABLE"
 
   mr_summary_reset
-  mr_log "converging this host: ${slots} slot(s), image ${ref}"
+  mr_log "converging this host: ${slots} slot(s), image ${image}, runner ${runner_version}"
+
+  dropped="$(mr_dropped_labels)"
+  if [ -n "$dropped" ]; then
+    mr_warn "ignoring RUNNER_EXTRA_LABELS entries the engine probes from the VM itself: ${dropped}"
+    mr_warn "  a static capability label says what SHOULD be in the image; only the VM knows what is."
+  fi
 
   # Re-run the full read-only gate here too: install.sh checked it before
   # Homebrew, but a run started from a local checkout skips that path.
@@ -724,10 +724,16 @@ main() {
 
   mr_converge_toolchain || exit $?
   mr_converge_secrets   || exit $?
+
+  # Install-time only. The engine needs a PAT to ensure the runner group
+  # exists; with OP_ITEM_REF set it records the vault reference and never
+  # writes the PAT to disk, so this value dies with this process.
+  MR_INSTALL_PAT="$(mr_op_read "$MR_OP_ITEM_REF")" || exit "$MR_EXIT_SECRETS"
+
+  mr_converge_engine || exit $?
   mr_converge_image "$version" || exit $?
-  mr_converge_agent_script || exit $?
   mr_wait_for_idle || exit $?
-  mr_converge_slots "$slots" "$ref" || exit $?
+  mr_converge_slots "$slots" "$image" "$runner_version" || exit $?
   mr_prune_images "$version"
 
   rc=0
@@ -736,7 +742,7 @@ main() {
   mr_summary_print
   printf '\n'
   if mr_summary_changed_anything; then
-    mr_log "slot logs: $(mr_default_log_path 1)$([ "$slots" -gt 1 ] && printf ', %s' "$(mr_default_log_path 2)")"
+    mr_log "slot logs: $(mr_slot_config_dir 1)/orchestrator.log$([ "$slots" -gt 1 ] && printf ', %s/orchestrator.log' "$(mr_slot_config_dir 2)")"
   else
     mr_log "nothing to change — this host was already converged"
   fi

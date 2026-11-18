@@ -8,8 +8,30 @@ setup() {
   REPO="$BATS_TEST_DIRNAME/.."
 }
 
-@test "agent script is executable" {
-  [ -x "$REPO/agent/mobile-runner-agent.sh" ]
+@test "the engine pins are present and well-formed" {
+  # This repo ships no runner loop. It pins one: a commit sha of the engine
+  # repo, and the checksum of the file at that commit. Both are production
+  # inputs — every host installs whatever they say.
+  # shellcheck source=/dev/null
+  source "$REPO/lib/common.sh"
+  local commit sha
+  commit="$(mr_read_ref_pin "$REPO/SETUP_VERSION")" || return 1
+  mr_commit_is_valid "$commit" || { echo "SETUP_VERSION is not a commit sha: $commit"; return 1; }
+  sha="$(mr_read_ref_pin "$REPO/SETUP_SHA256")" || return 1
+  mr_sha256_is_valid "$sha" || { echo "SETUP_SHA256 is not a sha256: $sha"; return 1; }
+}
+
+@test "the runner version pin is a version" {
+  # shellcheck source=/dev/null
+  source "$REPO/lib/common.sh"
+  local v; v="$(mr_read_ref_pin "$REPO/RUNNER_VERSION")" || return 1
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a runner version: $v"; return 1; }
+}
+
+@test "this repo implements no runner loop of its own" {
+  # The whole point of the wrapper: one engine, pinned, not a second copy that
+  # drifts. A re-introduced agent script is the regression to catch.
+  [ ! -e "$REPO/agent" ] || { echo "agent/ is back — the engine is pinned, not vendored"; return 1; }
 }
 
 @test "install.sh exists and is executable — it is the product" {
@@ -28,7 +50,7 @@ setup() {
   # construct in any of these breaks a fresh install with a syntax error.
   [ -x /bin/bash ] || skip "no /bin/bash"
   local f
-  for f in "$REPO"/install.sh "$REPO"/lib/*.sh "$REPO"/agent/*.sh; do
+  for f in "$REPO"/install.sh "$REPO"/lib/*.sh; do
     run /bin/bash -n "$f"
     [ "$status" -eq 0 ] || {
       echo "not bash-3.2 parseable: $f"
@@ -40,7 +62,7 @@ setup() {
 
 @test "every shell file parses" {
   local f
-  for f in "$REPO"/install.sh "$REPO"/lib/*.sh "$REPO"/agent/*.sh; do
+  for f in "$REPO"/install.sh "$REPO"/lib/*.sh; do
     run bash -n "$f"
     [ "$status" -eq 0 ] || {
       echo "failed to parse: $f"
@@ -49,13 +71,9 @@ setup() {
   done
 }
 
-@test "plist template carries no credential value" {
-  ! grep -E "ghp_|github_pat_" "$REPO/agent/com.zukan.mobile-runner-agent.plist.tmpl"
-}
-
 @test "no shell file carries a credential value" {
   ! grep -rE "ghp_[A-Za-z0-9]{20}|github_pat_[A-Za-z0-9_]{20}" \
-      "$REPO/install.sh" "$REPO/lib" "$REPO/agent"
+      "$REPO/install.sh" "$REPO/lib"
 }
 
 @test "IMAGE_VERSION pin exists and holds one valid version (FR-015)" {

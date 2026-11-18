@@ -102,14 +102,21 @@ seed_slot() {
   [ "$status" -ne 0 ]
 }
 
-@test "legacy: a plist rendered from the real template is NOT legacy" {
-  # Regression: the template's comment header says "never add ZUKAN_GH_PAT
-  # here", so a substring search classifies the installer's own freshly
-  # rendered output as the legacy layout — and a converged host would be
-  # torn down and re-migrated on every re-run, restarting live CI slots.
-  mr_render_plist "$BATS_TEST_DIRNAME/../agent/com.zukan.mobile-runner-agent.plist.tmpl" \
-    1 zukan-mobile-runner-2026.08.1 "" /tmp/slot1.log \
-    > "$AGENTS_DIR/com.zukan.mobile-runner-agent.slot1.plist"
+@test "legacy: a plist that merely MENTIONS the PAT key in a comment is NOT legacy" {
+  # Regression: detection is a substring search, and the engine's generated
+  # plist may carry explanatory comments. Classifying a converged host's own
+  # plist as legacy would tear it down and re-migrate it on every re-run,
+  # restarting live CI slots each time.
+  cat > "$AGENTS_DIR/com.zukan.mobile-runner-agent.slot1.plist" <<'P'
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Never add a ZUKAN_GH_PAT key here; the engine op-reads per cycle. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.zukan.mobile-runner-agent.slot1</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>CONFIG_DIR</key><string>/Users/ci/.gha-runner/slot1</string>
+  </dict>
+</dict></plist>
+P
   run mr_plist_is_legacy "$AGENTS_DIR/com.zukan.mobile-runner-agent.slot1.plist"
   [ "$status" -ne 0 ]
 }

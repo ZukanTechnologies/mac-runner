@@ -1,0 +1,5 @@
+# sha256 of mac/runner/setup at SETUP_VERSION.
+#
+# Checked before the script is executed. The pin says WHICH revision; this says
+# the bytes we got are that revision — a pinned URL still traverses the network.
+2fb582865eea452ec8913085fd7135f55597c47f557124c7bfecd5d3ad73b89a

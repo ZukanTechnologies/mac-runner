@@ -1,0 +1,7 @@
+# The troymccabe/setup commit this host's runner engine is built from.
+# troymccabe/setup#9 merge (power-cut resilience); untagged — the sha is the pin.
+#
+# A commit sha, never a tag or branch: tags can be moved and branches always
+# move, and either would silently change what every host installs. Bump this
+# together with SETUP_SHA256.
+0a97d4d6cfbaff48f86f92fccfdb21e59663982b
