@@ -152,6 +152,38 @@ EOF
   [[ "$output" == *"[warn]"* ]]
 }
 
+@test "verify image: the local VM the slots clone passes even after Tart pruned its OCI cache" {
+  # Regression: verify used to demand the GHCR reference, but BASE_IMAGE is the
+  # bare local VM. `tart clone <ref> <local>` leaves both behind, and Tart
+  # auto-prunes the OCI copy under disk pressure, so every later re-run failed
+  # verify (exit 40) on a host whose slots were healthy.
+  mr_stub tart 'echo "[{\"Source\":\"local\",\"Name\":\"zukan-mobile-runner-2026.08.1\",\"State\":\"stopped\"}]"'
+  run mr_verify_image 2026.08.1
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"zukan-mobile-runner-2026.08.1 present"* ]]
+}
+
+@test "verify image: only the registry copy in the OCI cache is NOT enough" {
+  # The slots clone the local VM, not the reference; an OCI entry alone means
+  # the image step never materialised it.
+  mr_stub tart 'echo "[{\"Source\":\"OCI\",\"Name\":\"ghcr.io/zukantechnologies/zukan-mobile-runner:2026.08.1\",\"State\":\"stopped\"}]"'
+  run mr_verify_image 2026.08.1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"zukan-mobile-runner-2026.08.1"* ]]
+}
+
+@test "verify image: a local VM of a different version is not the pin" {
+  mr_stub tart 'echo "[{\"Source\":\"local\",\"Name\":\"zukan-mobile-runner-2026.07.4\",\"State\":\"stopped\"}]"'
+  run mr_verify_image 2026.08.1
+  [ "$status" -ne 0 ]
+}
+
+@test "verify image: an empty host fails" {
+  mr_stub tart 'echo "[]"'
+  run mr_verify_image 2026.08.1
+  [ "$status" -ne 0 ]
+}
+
 # --- token file handling (FR-009) -------------------------------------------
 
 @test "token: written owner-only, atomically, with no temp file left behind" {
