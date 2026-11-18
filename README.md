@@ -59,6 +59,8 @@ It converges the host — observe, then change only what differs — in this ord
 
 Every step is safe to interrupt. Re-running resumes.
 
+**After a first install, reboot the Mac once.** A clean install proves the slots run; only a reboot proves the host comes back by itself — auto-login names the CI user, the slot LaunchAgents load in that session, and runners re-register with no one touching it. Check with the runner listing under [Operations](#operations) a couple of minutes after the login window would have appeared. If nothing registers, see *Nothing registers after reboot* under [Troubleshooting](#troubleshooting).
+
 ## Architecture: this repo pins an engine
 
 ```
@@ -119,7 +121,12 @@ One vault, one read-only service account, two items. Full contract: [`specs/027-
 
 **Rolling out a new image:**
 
-1. Build and push it from zukan: `PUSH=1 infra/mobile-ci/packer/build.sh <version>` on a fleet Mac.
+1. Build and push it from zukan: `PUSH=1 infra/mobile-ci/packer/build.sh <version>` on a fleet Mac. To publish a local VM that already exists (e.g. on the Mac that built it), push it directly — `TART_REGISTRY_USERNAME` / `TART_REGISTRY_PASSWORD` keep the push credential out of the keychain:
+   ```bash
+   TART_REGISTRY_USERNAME=<user> TART_REGISTRY_PASSWORD=<PAT with write:packages> \
+     tart push zukan-mobile-runner-<version> ghcr.io/zukantechnologies/zukan-mobile-runner:<version>
+   ```
+   **First push of the package only:** GHCR creates `zukan-mobile-runner` as a **private** package that only the pusher and org owners can read. Open the package's settings on GitHub (org → Packages → `zukan-mobile-runner` → Package settings → Manage access) and give the account behind `ghcr-pull-pat` **Read** access. Without it every host fails the image step with exit `21`. Later versions inherit the access; this is once per package, not per version.
 2. Open a PR here bumping `IMAGE_VERSION` to that version. **This is the rollout** — no host is edited by hand, and no plist carries a version literal.
 3. Re-run the one-liner on each host. Each converges: pulls the new image, restarts its slots on it, prunes the old one.
 
@@ -172,7 +179,7 @@ Every non-zero exit prints a one-line remediation. Re-running the same command a
 | `10` | Unsupported machine (Intel, macOS < 15) | Use a different Mac; nothing was changed |
 | `11` | Operator-remediable (FileVault on, low disk, auto-login pause aborted) | Fix the named condition, re-run |
 | `20` | Secrets (bad token, missing vault item, 1Password unreachable — distinguished) | Follow the message; only a bad token needs rotating |
-| `21` | Registry (`tart login` or `tart pull` failed) | Check the pinned version exists in GHCR and `ghcr-pull-pat` can read it |
+| `21` | Registry (`tart login` or `tart pull` failed) | Check the pinned version exists in GHCR and that `ghcr-pull-pat`'s account has **Read** on the package (Manage access — a newly pushed package is private to its pusher and org owners; see [Rolling out a new image](#image-version-pin--this-repo-owns-it)) |
 | `30` | Converge (render or launchctl failure) | Usually the GUI-session rule below; state is safe to re-run |
 | `40` | Verify (installed, but a health check failed) | The install landed; check the named check and the slot log |
 
